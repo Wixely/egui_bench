@@ -31,7 +31,7 @@ nono = { version = "0.80", default-features = false, optional = true }
 base64 = { version = "0.23", optional = true }
 async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
-ignore = { version = "0.4.33", optional = true }
+ignore = { version = "0.4", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "gzip"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 scraper = { version = "0.25", default-features = false, optional = true }
