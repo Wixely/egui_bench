@@ -184,6 +184,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "reaches the internet"]
+    async fn live_the_directory_answers() {
+        let out = find(&serde_json::json!({"query": "pdf", "limit": 3}), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.contains("npx skills add") && out.contains("installs"), "{out}");
+    }
+
+    #[tokio::test]
     async fn a_missing_query_is_refused() {
         let err = find(&serde_json::json!({}), &CancellationToken::new()).await.unwrap_err();
         assert_eq!(err, "missing `query`");
