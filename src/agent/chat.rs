@@ -1,11 +1,10 @@
 use super::config::Config;
 use super::grants::{self, Grants};
 use super::workspace::Workspace;
-use super::{Backend, Cx, Desk, local, skillset, tools};
+use super::{Backend, CancellationToken, Cx, Desk, Services, local, skillset, tools};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::io::BufRead;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -33,10 +32,11 @@ pub struct Chat {
     pub config: Config,
     pub turns: Vec<Turn>,
     pub draft: String,
+    pub services: Arc<Services>,
     history: Vec<Value>,
     remembered: usize,
     updates: Option<Receiver<Update>>,
-    stop: Arc<AtomicBool>,
+    stop: CancellationToken,
     speaking: bool,
 }
 
@@ -48,12 +48,18 @@ impl Chat {
             backend,
             turns: Vec::new(),
             draft: String::new(),
+            services: Arc::new(Services::default()),
             history: Vec::new(),
             remembered: 0,
             updates: None,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: CancellationToken::new(),
             speaking: false,
         }
+    }
+
+    pub fn with_services(mut self, services: Services) -> Self {
+        self.services = Arc::new(services);
+        self
     }
 
     pub fn workspace_path(&self) -> std::path::PathBuf {
@@ -71,10 +77,13 @@ impl Chat {
         self.turns.clear();
         self.history.clear();
         self.remembered = 0;
+        let (services, owner) =
+            (self.services.clone(), self.workspace_path().display().to_string());
+        super::runtime().spawn(async move { services.jobs.kill_all(&owner).await });
     }
 
     pub fn interrupt(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.cancel();
     }
 
     pub fn ask(&mut self, text: &str, desk: Desk) {
@@ -110,17 +119,15 @@ impl Chat {
         let (out, updates) = channel();
         self.updates = Some(updates);
         self.speaking = false;
-        self.stop = Arc::new(AtomicBool::new(false));
+        self.stop = CancellationToken::new();
         let worker = Worker {
             backend: self.backend.clone(),
             config: self.config.clone(),
-            workspace,
+            cx: Cx { workspace, desk, stop: self.stop.clone(), services: self.services.clone() },
             history: self.history.clone(),
-            desk,
             out,
-            stop: self.stop.clone(),
         };
-        std::thread::spawn(move || worker.run());
+        super::runtime().spawn(worker.run());
     }
 
     pub fn poll(&mut self) {
@@ -197,11 +204,9 @@ impl Chat {
 struct Worker {
     backend: Arc<dyn Backend>,
     config: Config,
-    workspace: Workspace,
+    cx: Cx,
     history: Vec<Value>,
-    desk: Desk,
     out: Sender<Update>,
-    stop: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -220,32 +225,27 @@ struct Call {
 impl Worker {
     fn say(&self, u: Update) {
         let _ = self.out.send(u);
-        self.desk.ring();
+        self.cx.desk.ring();
     }
 
-    fn run(mut self) {
-        if let Err(e) = self.exchange() {
+    async fn run(mut self) {
+        if let Err(e) = self.exchange().await {
             self.say(Update::Fault(e));
         }
         self.say(Update::Done);
     }
 
-    fn exchange(&mut self) -> Result<(), String> {
-        let agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_recv_response(Some(PATIENCE))
-            .timeout_recv_body(Some(PATIENCE))
-            .http_status_as_error(false)
-            .user_agent(self.backend.user_agent())
-            .build()
-            .new_agent();
+    async fn exchange(&mut self) -> Result<(), String> {
         let tools = tools::list(self.backend.as_ref());
         let steps = self.config.steps.max(1);
         for _ in 0..steps {
-            if self.stop.load(Ordering::Relaxed) {
+            if self.cx.stop.is_cancelled() {
                 return Err("stopped".into());
             }
-            let reply = self.complete(&agent, &tools)?;
+            let reply = tokio::select! {
+                r = self.complete(&tools) => r?,
+                _ = self.cx.stop.cancelled() => return Err("stopped".into()),
+            };
             let mut message = json!({ "role": "assistant", "content": reply.text });
             if !reply.calls.is_empty() {
                 message["tool_calls"] = Value::Array(
@@ -268,7 +268,7 @@ impl Worker {
                 return Ok(());
             }
             for call in reply.calls {
-                let answer = self.run_tool(&call);
+                let answer = self.run_tool(&call).await;
                 let content = match &answer {
                     Ok(v) => v.clone(),
                     Err(e) => json!({ "error": e }).to_string(),
@@ -284,19 +284,19 @@ impl Worker {
         Err(format!("stopped after {steps} tool calls"))
     }
 
-    fn run_tool(&self, call: &Call) -> Result<String, String> {
+    async fn run_tool(&self, call: &Call) -> Result<String, String> {
         self.say(Update::Calling { name: call.name.clone(), args: call.args.clone() });
         let args: Value = if call.args.trim().is_empty() {
             Value::Null
         } else {
             serde_json::from_str(&call.args).map_err(|e| format!("bad arguments: {e}"))?
         };
-        let cx = Cx { workspace: &self.workspace, desk: &self.desk, stop: &self.stop };
-        local::run(self.backend.as_ref(), &cx, &call.name, &args)
+        local::run(self.backend.as_ref(), &self.cx, &call.name, &args)
+            .await
             .unwrap_or_else(|| Err(format!("no tool called {}", call.name)))
     }
 
-    fn complete(&self, agent: &ureq::Agent, tools: &Value) -> Result<Completion, String> {
+    async fn complete(&self, tools: &Value) -> Result<Completion, String> {
         let mut messages = vec![json!({ "role": "system", "content": self.brief() })];
         messages.extend(self.history.iter().cloned());
         let body = json!({
@@ -305,36 +305,47 @@ impl Worker {
             "tools": tools,
             "stream": true,
         });
-        let mut req = agent.post(self.config.endpoint()).header("content-type", "application/json");
+        let mut req = super::http::client()
+            .post(self.config.endpoint())
+            .header("content-type", "application/json")
+            .header("user-agent", self.backend.user_agent())
+            .timeout(PATIENCE)
+            .body(body.to_string());
         if !self.config.key.trim().is_empty() {
-            req = req.header("authorization", format!("Bearer {}", self.config.key.trim()));
+            req = req.bearer_auth(self.config.key.trim());
         }
-        let resp = req.send(body.to_string()).map_err(|e| e.to_string())?;
+        let resp = req.send().await.map_err(|e| super::http::describe(&e))?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.into_body().read_to_string().unwrap_or_default();
+            let text = resp.text().await.unwrap_or_default();
             return Err(format!("{status}: {}", text.trim()));
         }
-        self.read_stream(std::io::BufReader::new(resp.into_body().into_reader()))
-    }
-
-    fn read_stream(&self, reader: impl BufRead) -> Result<Completion, String> {
         let mut reply = Completion::default();
-        for line in reader.lines() {
-            if self.stop.load(Ordering::Relaxed) {
-                return Err("stopped".into());
-            }
-            let line = line.map_err(|e| e.to_string())?;
-            let Some(data) = line.strip_prefix("data:") else { continue };
-            let data = data.trim();
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                self.take_delta(&v, &mut reply);
+        let mut pending = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| super::http::describe(&e))?;
+            pending.extend_from_slice(&chunk);
+            while let Some(at) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=at).collect();
+                self.take_line(&String::from_utf8_lossy(&line), &mut reply);
             }
         }
+        if !pending.is_empty() {
+            self.take_line(&String::from_utf8_lossy(&pending), &mut reply);
+        }
         Ok(reply)
+    }
+
+    fn take_line(&self, line: &str, reply: &mut Completion) {
+        let Some(data) = line.trim_end().strip_prefix("data:") else { return };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(data) {
+            self.take_delta(&v, reply);
+        }
     }
 
     fn take_delta(&self, v: &Value, reply: &mut Completion) {
@@ -367,11 +378,9 @@ impl Worker {
     }
 
     fn brief(&self) -> String {
-        let skills = skillset::discover(
-            &skillset::roots(self.workspace.root()),
-            &self.backend.preferred_skills(),
-        );
-        let base = self.backend.brief(self.workspace.root(), &skills);
+        let root = self.cx.workspace.root();
+        let skills = skillset::discover(&skillset::roots(root), &self.backend.preferred_skills());
+        let base = self.backend.brief(root, &skills);
         match self.config.brief.trim() {
             "" => base,
             extra => format!("{base}\n\n{extra}"),
@@ -397,6 +406,7 @@ mod tests {
         }
     }
 
+    #[super::super::async_trait]
     impl Backend for Test {
         fn app(&self) -> &'static str {
             "egui-bench-test"
@@ -433,11 +443,9 @@ mod tests {
         let w = Worker {
             backend: Arc::new(Test::new()),
             config: Config { url, model: "stub".into(), ..Config::default() },
-            workspace: Workspace::open(&dir).unwrap(),
+            cx: Cx::new(Workspace::open(&dir).unwrap(), desk),
             history: vec![json!({ "role": "user", "content": "what things are there" })],
-            desk,
             out,
-            stop: Arc::new(AtomicBool::new(false)),
         };
         (w, updates, asks)
     }
@@ -581,7 +589,7 @@ mod tests {
             assert!(ask.name == "list_things");
             let _ = ask.reply.send(Ok(json!({ "things": [{ "name": "a" }] })));
         });
-        w.run();
+        super::super::runtime().block_on(w.run());
         window.join().expect("the window answered");
 
         let mut said = String::new();
@@ -601,9 +609,11 @@ mod tests {
 
         let first = asked.recv().expect("a first request");
         assert_eq!(first["stream"], true);
+        let sandboxed = super::super::tools::NEEDS_SANDBOX.len();
+        let builtins = super::super::local::NAMES.len() - sandboxed;
         assert_eq!(
             first["tools"].as_array().map(Vec::len),
-            Some(9 + usize::from(super::super::sandbox::supported()))
+            Some(builtins + 1 + if super::super::sandbox::supported() { sandboxed } else { 0 })
         );
         assert_eq!(first["messages"][0]["role"], "system");
         let second = asked.recv().expect("a second request");
@@ -634,7 +644,7 @@ mod tests {
             }
         });
         let (w, updates, _asks) = worker(url);
-        w.run();
+        super::super::runtime().block_on(w.run());
         let faults: Vec<String> = updates
             .try_iter()
             .filter_map(|u| match u {
@@ -662,6 +672,35 @@ mod tests {
             panic!("no fault: {:?}", c.turns.len())
         };
         assert!(why.contains("workspace") && why.contains("home folder"), "{why}");
+    }
+
+    #[test]
+    fn a_stopped_chat_ends_without_waiting_for_the_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!("http://{}/v1", listener.local_addr().expect("an address"));
+        let hold = std::thread::spawn(move || {
+            let held = listener.incoming().next();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(held);
+        });
+        let (w, updates, _asks) = worker(url);
+        let stop = w.cx.stop.clone();
+        let started = std::time::Instant::now();
+        super::super::runtime().spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.cancel();
+        });
+        super::super::runtime().block_on(w.run());
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let faults: Vec<String> = updates
+            .try_iter()
+            .filter_map(|u| match u {
+                Update::Fault(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(faults, ["stopped"]);
+        let _ = hold.join();
     }
 
     #[test]

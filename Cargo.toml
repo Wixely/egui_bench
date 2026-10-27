@@ -1,6 +1,6 @@
 [package]
 name = "egui_bench"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT AND OFL-1.1"
@@ -15,7 +15,7 @@ exclude = ["docs/*"]
 viewer3d = ["dep:egui-wgpu", "dep:wgpu", "dep:bytemuck"]
 update = ["dep:ureq", "dep:serde_json", "dep:flate2", "dep:tar", "dep:sha2", "dep:zip"]
 markdown = ["dep:pulldown-cmark"]
-agent = ["markdown", "dep:ureq", "dep:serde", "dep:serde_json", "dep:dirs"]
+agent = ["markdown", "dep:ureq", "dep:serde", "dep:serde_json", "dep:dirs", "dep:tokio", "dep:tokio-util", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:async-trait", "dep:futures-util", "dep:scraper", "dep:url", "dep:ignore", "dep:base64"]
 sandbox = ["agent", "dep:nono"]
 # Whisper and Kokoro, run in this process through candle. Pulls in candle, so it is off unless asked for.
 speech = ["agent", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:byteorder", "dep:tracing", "dep:rand", "dep:rand_distr"]
@@ -28,6 +28,17 @@ speech-metal = ["speech", "candle-core/metal", "candle-nn/metal", "candle-transf
 nono = { version = "0.80", default-features = false, optional = true }
 
 [dependencies]
+base64 = { version = "0.23", optional = true }
+async-trait = { version = "0.1", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+ignore = { version = "0.4.33", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "gzip"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+scraper = { version = "0.25", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+url = { version = "2", optional = true }
+webpki-roots = { version = "1", optional = true }
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 byteorder = { version = "1", optional = true }
 candle-core = { version = "0.11", optional = true }
@@ -52,6 +63,8 @@ wgpu = { version = "29", default-features = false, features = ["wgsl"], optional
 zip = { version = "9.0.2", default-features = false, features = ["deflate"], optional = true }
 
 [dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
 egui_kittest = { version = "0.35", features = ["wgpu"] }
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",

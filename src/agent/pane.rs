@@ -434,8 +434,14 @@ pub fn summary(backend: &dyn Backend, name: &str, args: &str) -> String {
             short(&field("path").or_else(|| field("pattern")).unwrap_or_default())
         }
         "bash" => short(&field("command").unwrap_or_default()),
+        "bash_output" | "bash_kill" => field("handle").unwrap_or_else(|| "list".into()),
         "request_access" => short(&field("path").unwrap_or_default()),
         "load_skill" => field("name").unwrap_or_else(|| "list".into()),
+        "web_search" | "find_skills" => short(&field("query").unwrap_or_default()),
+        "web_fetch" => short(&field("url").unwrap_or_default()),
+        "todo_write" => super::todo::summary(&v).unwrap_or_default(),
+        "code_outline" | "code_diagnostics" => short(&field("path").unwrap_or_default()),
+        "code_find" => short(&field("name").unwrap_or_default()),
         _ => short(args),
     }
 }
@@ -472,6 +478,7 @@ mod tests {
 
     struct Quiet;
 
+    #[super::super::async_trait]
     impl Backend for Quiet {
         fn app(&self) -> &'static str {
             "egui-bench-test"
@@ -504,6 +511,13 @@ mod tests {
         assert_eq!(s("load_skill", "{}"), "list");
         assert_eq!(s("launch", r#"{"tool":"gcad"}"#), "gcad");
         assert_eq!(s("list_things", "{}"), "");
+        assert_eq!(s("web_fetch", r#"{"url":"https://docs.rs"}"#), "https://docs.rs");
+        assert_eq!(s("code_find", r#"{"name":"Shape::area"}"#), "Shape::area");
+        assert_eq!(s("bash_output", "{}"), "list");
+        assert_eq!(
+            s("todo_write", r#"{"items":[{"text":"a","status":"done"},{"text":"b"}]}"#),
+            "1 of 2 done"
+        );
     }
 
     #[test]

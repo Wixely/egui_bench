@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 const PATIENCE: Duration = Duration::from_secs(600);
 
@@ -36,7 +36,7 @@ pub struct Request {
 #[derive(Debug)]
 struct Waiting {
     request: Request,
-    reply: Sender<Decision>,
+    reply: oneshot::Sender<Decision>,
 }
 
 #[derive(Debug, Default)]
@@ -101,15 +101,15 @@ impl Grants {
         self.lock().waiting.retain(|w| w.request.id != id);
     }
 
-    pub fn ask(
+    pub async fn ask(
         &self,
         path: PathBuf,
         write: bool,
         reason: &str,
-        stop: &AtomicBool,
-        ring: &dyn Fn(),
+        stop: &CancellationToken,
+        ring: &(dyn Fn() + Sync),
     ) -> Result<Decision, String> {
-        let (reply, answer) = channel();
+        let (reply, answer) = oneshot::channel();
         let id = {
             let mut state = self.lock();
             state.next += 1;
@@ -119,23 +119,15 @@ impl Grants {
             id
         };
         ring();
-        let started = Instant::now();
-        loop {
-            match answer.recv_timeout(Duration::from_millis(200)) {
-                Ok(decision) => return Ok(decision),
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err("the request was dropped".into());
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if stop.load(Ordering::Relaxed) {
-                        self.withdraw(id);
-                        return Err("stopped".into());
-                    }
-                    if started.elapsed() > PATIENCE {
-                        self.withdraw(id);
-                        return Err("the user did not answer in ten minutes".into());
-                    }
-                }
+        tokio::select! {
+            decision = answer => decision.map_err(|_| "the request was dropped".to_string()),
+            _ = stop.cancelled() => {
+                self.withdraw(id);
+                Err("stopped".into())
+            }
+            _ = tokio::time::sleep(PATIENCE) => {
+                self.withdraw(id);
+                Err("the user did not answer in ten minutes".into())
             }
         }
     }
@@ -233,7 +225,21 @@ pub fn vet_with(
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn asking(
+        grants: &Grants,
+        path: &str,
+        write: bool,
+        reason: &str,
+        stop: &CancellationToken,
+    ) -> std::thread::JoinHandle<Result<Decision, String>> {
+        let (asker, stop, path, reason) =
+            (grants.clone(), stop.clone(), PathBuf::from(path), reason.to_string());
+        std::thread::spawn(move || {
+            crate::agent::runtime().block_on(asker.ask(path, write, &reason, &stop, &|| {}))
+        })
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("grants-{name}-{}", std::process::id()));
@@ -268,12 +274,8 @@ mod tests {
     #[test]
     fn the_user_answering_wakes_the_request_and_records_the_grant() {
         let grants = Grants::default();
-        let asker = grants.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiting = std::thread::spawn({
-            let stop = stop.clone();
-            move || asker.ask(PathBuf::from("/data/parts"), true, " for the plate ", &stop, &|| {})
-        });
+        let stop = CancellationToken::new();
+        let waiting = asking(&grants, "/data/parts", true, " for the plate ", &stop);
         let request = loop {
             if let Some(r) = grants.pending().pop() {
                 break r;
@@ -294,12 +296,8 @@ mod tests {
     #[test]
     fn a_denial_grants_nothing() {
         let grants = Grants::default();
-        let asker = grants.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiting = std::thread::spawn({
-            let stop = stop.clone();
-            move || asker.ask(PathBuf::from("/data/parts"), false, "", &stop, &|| {})
-        });
+        let stop = CancellationToken::new();
+        let waiting = asking(&grants, "/data/parts", false, "", &stop);
         let id = loop {
             if let Some(r) = grants.pending().pop() {
                 break r.id;
@@ -314,12 +312,8 @@ mod tests {
     #[test]
     fn write_cannot_be_granted_for_a_read_request() {
         let grants = Grants::default();
-        let asker = grants.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiting = std::thread::spawn({
-            let stop = stop.clone();
-            move || asker.ask(PathBuf::from("/data/parts"), false, "", &stop, &|| {})
-        });
+        let stop = CancellationToken::new();
+        let waiting = asking(&grants, "/data/parts", false, "", &stop);
         let id = loop {
             if let Some(r) = grants.pending().pop() {
                 break r.id;
@@ -334,16 +328,12 @@ mod tests {
     #[test]
     fn stopping_withdraws_a_waiting_request() {
         let grants = Grants::default();
-        let asker = grants.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let waiting = std::thread::spawn({
-            let stop = stop.clone();
-            move || asker.ask(PathBuf::from("/data/parts"), false, "", &stop, &|| {})
-        });
+        let stop = CancellationToken::new();
+        let waiting = asking(&grants, "/data/parts", false, "", &stop);
         while grants.pending().is_empty() {
             std::thread::sleep(Duration::from_millis(5));
         }
-        stop.store(true, Ordering::Relaxed);
+        stop.cancel();
         assert_eq!(waiting.join().unwrap(), Err("stopped".to_string()));
         assert!(grants.pending().is_empty());
         assert!(grants.list().is_empty());

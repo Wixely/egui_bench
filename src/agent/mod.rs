@@ -1,22 +1,33 @@
 pub mod chat;
+pub mod code;
 pub mod config;
 pub mod grants;
+pub mod http;
+pub mod jobs;
 pub mod local;
+pub mod lsp;
 pub mod pane;
 pub mod sandbox;
 pub mod settings;
+pub mod skills;
 pub mod skillset;
+pub mod spawn;
+pub mod todo;
 pub mod toolkit;
 pub mod tools;
+pub mod web;
 pub mod workspace;
+
+pub use async_trait::async_trait;
+pub use tokio_util::sync::CancellationToken;
 
 use serde_json::Value;
 use skillset::Skill;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::oneshot;
 use workspace::Workspace;
 
 pub type Reply = Result<Value, String>;
@@ -25,10 +36,28 @@ pub type Poll<H> = Box<dyn FnMut(&mut H) -> Option<Reply>>;
 
 const PATIENCE: Duration = Duration::from_secs(900);
 
+pub fn runtime() -> tokio::runtime::Handle {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return handle;
+    }
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("egui-bench-agent")
+                .enable_all()
+                .build()
+                .expect("a tokio runtime for the agent")
+        })
+        .handle()
+        .clone()
+}
+
 pub struct Ask {
     pub name: String,
     pub args: Value,
-    pub reply: Sender<Reply>,
+    pub reply: oneshot::Sender<Reply>,
 }
 
 #[derive(Clone)]
@@ -47,40 +76,67 @@ impl Desk {
         self.ctx.request_repaint();
     }
 
-    pub fn ask(&self, name: &str, args: Value, stop: &AtomicBool) -> Reply {
-        let (reply, answer) = channel();
+    pub async fn ask(&self, name: &str, args: Value, stop: &CancellationToken) -> Reply {
+        let (reply, answer) = oneshot::channel();
         let ask = Ask { name: name.to_string(), args, reply };
         self.jobs.send(ask).map_err(|_| "the window has gone".to_string())?;
         self.ring();
-        let started = Instant::now();
-        loop {
-            match answer.recv_timeout(Duration::from_millis(200)) {
-                Ok(r) => return r,
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err("the window dropped the request".into());
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if stop.load(Ordering::Relaxed) {
-                        return Err("stopped".into());
-                    }
-                    if started.elapsed() > PATIENCE {
-                        return Err(format!("the window did not answer in {PATIENCE:?}"));
-                    }
-                }
-            }
+        tokio::select! {
+            r = answer => r.unwrap_or_else(|_| Err("the window dropped the request".into())),
+            _ = stop.cancelled() => Err("stopped".into()),
+            _ = tokio::time::sleep(PATIENCE) => Err(format!("the window did not answer in {PATIENCE:?}")),
         }
     }
 }
 
-pub struct Cx<'a> {
-    pub workspace: &'a Workspace,
-    pub desk: &'a Desk,
-    pub stop: &'a AtomicBool,
+#[derive(Default)]
+pub struct Services {
+    pub jobs: jobs::Jobs,
+    pub code: Arc<code::Code>,
+    pub reader: Option<Arc<dyn web::Reader>>,
 }
 
-impl Cx<'_> {
-    pub fn ask(&self, name: &str, args: Value) -> Reply {
-        self.desk.ask(name, args, self.stop)
+impl Services {
+    pub fn with_code(mut self, settings: code::Settings) -> Self {
+        self.code = Arc::new(code::Code::new(settings));
+        self
+    }
+
+    pub fn with_reader(mut self, reader: Arc<dyn web::Reader>) -> Self {
+        self.reader = Some(reader);
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct Cx {
+    pub workspace: Workspace,
+    pub desk: Desk,
+    pub stop: CancellationToken,
+    pub services: Arc<Services>,
+}
+
+impl Cx {
+    pub fn new(workspace: Workspace, desk: Desk) -> Self {
+        Self {
+            workspace,
+            desk,
+            stop: CancellationToken::new(),
+            services: Arc::new(Services::default()),
+        }
+    }
+
+    pub fn with_services(mut self, services: Arc<Services>) -> Self {
+        self.services = services;
+        self
+    }
+
+    pub async fn ask(&self, name: &str, args: Value) -> Reply {
+        self.desk.ask(name, args, &self.stop).await
+    }
+
+    pub fn ask_blocking(&self, name: &str, args: Value) -> Reply {
+        runtime().block_on(self.ask(name, args))
     }
 }
 
@@ -91,6 +147,7 @@ pub struct Welcome {
     pub placeholder: String,
 }
 
+#[async_trait]
 pub trait Backend: Send + Sync + 'static {
     fn app(&self) -> &'static str;
 
@@ -114,15 +171,19 @@ pub trait Backend: Send + Sync + 'static {
         self.toolkit().specs()
     }
 
-    fn call(&self, name: &str, args: &Value, cx: &Cx) -> Option<Result<String, String>> {
-        self.toolkit().call(name, args, cx)
+    async fn call(&self, name: &str, args: &Value, cx: &Cx) -> Option<Result<String, String>> {
+        self.toolkit().call(name, args, cx).await
     }
 
     fn preferred_skills(&self) -> Vec<String> {
         Vec::new()
     }
 
-    fn tool_dirs(&self, _cx: &Cx) -> Vec<PathBuf> {
+    async fn tool_dirs(&self, _cx: &Cx) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn leave_out(&self) -> Vec<&'static str> {
         Vec::new()
     }
 
@@ -143,7 +204,7 @@ pub trait Host: Sized {
 }
 
 pub struct Pending<H> {
-    reply: Sender<Reply>,
+    reply: oneshot::Sender<Reply>,
     poll: Poll<H>,
 }
 

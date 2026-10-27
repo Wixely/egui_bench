@@ -11,6 +11,8 @@ pub struct Plan {
     pub command: String,
     #[serde(default)]
     pub shared: Vec<Shared>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -171,6 +173,7 @@ pub fn run_helper() -> Option<i32> {
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
+        .envs(plan.env.iter().cloned())
         .exec();
     fail(format!("{}: {error}", shell().display()))
 }

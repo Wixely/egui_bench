@@ -122,34 +122,47 @@ being drawn, and an unfinished fence while a reply streams is already a code blo
 
 A chat with any OpenAI-compatible server that has tool calls, filling the central
 panel, with a workspace folder the model reads and writes in. It brings the loop,
-the pane, the settings page and these tools: `load_skill` (reads `SKILL.md` files
-from `~/.agents/skills` and the workspace), `list_files`, `read_file`, `write_file`,
-`edit_file`, `search_files`, `workspace`, `request_access` and `bash`. File tools cannot
-leave the workspace unless the user shares a folder: `request_access` puts the path and the
-model's reason in a card, and the user picks read only, read and write, or deny. A share
-covers that folder and what is under it, never its parent or neighbours, follows no link out
-of itself, and ends when the chat is cleared or the user clicks it away. Credential folders
-(`~/.ssh`, `~/.aws`, browser profiles, the app's own config), the whole home folder and a
-drive root are refused without asking. `Agent::needs_you()` says when a card is waiting, so
-the app can flag its tab. `bash` runs in an OS sandbox through `nono` (Landlock on Linux, Seatbelt
-on macOS): the system and the tools are readable, only the workspace and a scratch
-folder are writable, the rest of the user's files are hidden, the environment is
-scrubbed and the network is open. It is left out of the tool list where there is no
-sandbox, which includes Windows.
+the pane, the settings page and these tools:
 
-An app supplies two things:
+| tools | what they do |
+|---|---|
+| `list_files`, `read_file`, `write_file`, `edit_file`, `search_files`, `workspace` | files in the workspace |
+| `request_access` | asks the user to share a folder outside it |
+| `bash`, `bash_output`, `bash_kill` | a shell command in the sandbox; with `background` it answers at once with a handle to read from and stop |
+| `code_outline`, `code_find`, `code_diagnostics` | code by its units, through a language server: a file's outline, a unit's source and everything that uses it, the errors in a file |
+| `web_search`, `web_fetch` | DuckDuckGo, Bing and Brave in turn; a page as markdown, read in pieces, saved to disk, or answered by a small model |
+| `load_skill`, `find_skills` | reads `SKILL.md` files from `~/.agents/skills` and the workspace; searches the skills.sh directory for one to install |
+| `todo_write` | a checklist for long work, drawn in the chat |
+
+File tools cannot leave the workspace unless the user shares a folder: `request_access` puts the
+path and the model's reason in a card, and the user picks read only, read and write, or deny. A
+share covers that folder and what is under it, never its parent or neighbours, follows no link out
+of itself, and ends when the chat is cleared or the user clicks it away. Credential folders
+(`~/.ssh`, `~/.aws`, browser profiles, the app's own config), the whole home folder and a drive
+root are refused without asking. `Agent::needs_you()` says when a card is waiting, so the app can
+flag its tab.
+
+`bash` and the language servers run in an OS sandbox through `nono` (Landlock on Linux, Seatbelt
+on macOS): the system and the tools are readable, only the workspace and a scratch folder are
+writable, the rest of the user's files are hidden, the environment is scrubbed and the network is
+open. A language server also reads the toolchain it needs (`~/.cargo`, `~/.rustup`, the Go module
+cache, nvm's nodes), never writes there. Tools that need the sandbox are left out of the tool list
+where there is none, which includes Windows. Background commands belong to the chat that started
+them and stop when it is cleared.
+
+Everything runs on tokio. With no runtime around it the crate starts a small one of its own
+(`agent::runtime()`); inside a tokio app it uses the app's. An app supplies two things:
 
 ```rust,ignore
 struct MyApp { agent: egui_bench::agent::Agent<MyApp>, /* ... */ }
 
+#[egui_bench::agent::async_trait]
 impl egui_bench::agent::Backend for Mine {
     fn app(&self) -> &'static str { "my-app" }
     fn brief(&self, workspace: &Path, skills: &[Skill]) -> String { /* system prompt */ }
     fn welcome(&self) -> Welcome { /* empty-state text */ }
-    fn specs(&self) -> Vec<Spec> { /* the app's own tools */ }
-    fn call(&self, name: &str, args: &Value, cx: &Cx) -> Option<Result<String, String>> {
-        // runs on the worker thread; cx.ask(name, args) reaches the host below
-    }
+    fn toolkit(&self) -> &Toolkit { /* the app's own tools */ }
+    fn leave_out(&self) -> Vec<&'static str> { vec!["web_search"] /* built-ins to drop */ }
 }
 
 impl egui_bench::agent::Host for MyApp {
@@ -161,11 +174,23 @@ impl egui_bench::agent::Host for MyApp {
 }
 ```
 
+A tool in the toolkit is async: `Tool::new(name, about, schema, |args, cx| async move { .. })`,
+`Tool::blocking` for code that blocks (it runs on tokio's blocking pool), `Tool::host` to hand
+the call to the UI thread, where `Host::call` answers it. `cx.ask(name, args).await` reaches the
+host from any tool, and `cx.stop` is cancelled when the user stops the chat. `Chat::with_services`
+swaps in a `Services` with an app's own language server settings or a `web::Reader` that answers
+`web_fetch`'s `prompt`.
+
 Each frame: `agent.poll()`, `agent.show(ui)` when its page is open, and
 `egui_bench::agent::serve(self, ctx)`. The binary must call
 `egui_bench::agent::sandbox::run_helper()` first thing in `main` and exit with its
 code when it returns `Some`, because the sandbox re-runs the app's own executable.
 Settings live in `<config dir>/<app>/agent`, readable by the user only.
+
+The tools are usable without the window too, by an agent of your own: `agent::local::run(backend,
+&cx, name, &args).await` runs one, `agent::tools::offered(backend)` lists the specs to send, and
+`agent::code::Code`, `agent::jobs::Jobs` and `agent::web` work alone. `spawn::Confine::Open` runs
+commands and language servers without the sandbox, for a host that trusts its agent.
 
 #### Voice for the agent window (`voice`, and feature `speech`)
 

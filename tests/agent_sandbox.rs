@@ -10,7 +10,7 @@ fn main() {
         std::process::exit(code);
     }
     let mut failed = Vec::new();
-    let cases: [(&str, fn()); 11] = [
+    let cases: [(&str, fn()); 13] = [
         ("a command writes inside the workspace and its scratch", writes_inside),
         ("a command cannot write outside the workspace", cannot_write_outside),
         ("a command cannot read what is outside the workspace", cannot_read_outside),
@@ -22,6 +22,8 @@ fn main() {
         ("a share does not widen to its neighbours", a_share_stays_where_it_was_put),
         ("names still resolve, since the network is open", names_resolve),
         ("a compiler runs without the system temp folder being opened", a_compiler_runs),
+        ("variables the plan names reach the command", plan_env_reaches_the_command),
+        ("a language server answers from inside the sandbox", a_language_server_runs_confined),
     ];
     for (name, case) in cases {
         match std::panic::catch_unwind(case) {
@@ -262,6 +264,68 @@ fn names_resolve() {
     let (_, out) =
         rig.run("curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com 2>&1");
     assert_eq!(out.trim(), "200", "names must still resolve inside the sandbox: {out}");
+}
+
+fn plan_env_reaches_the_command() {
+    let rig = Rig::new("planenv");
+    if !rig.usable() {
+        return;
+    }
+    let plan = serde_json::json!({
+        "workspace": rig.workspace,
+        "scratch": rig.scratch,
+        "tool_dirs": [],
+        "command": "echo $CARGO_HOME; echo ${SECRET_TOKEN:-none}",
+        "shared": [],
+        "env": [["CARGO_HOME", "/opt/cargo"]],
+    })
+    .to_string();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .arg(sandbox::FLAG)
+        .arg(plan)
+        .env("SECRET_TOKEN", "leaked")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/opt/cargo\nnone\n");
+}
+
+fn a_language_server_runs_confined() {
+    use egui_bench::agent::code::{Code, Settings};
+    use egui_bench::agent::workspace::Workspace;
+    use egui_bench::agent::{CancellationToken, runtime};
+    if !sandbox::supported() {
+        return;
+    }
+    let found = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("rust-analyzer").is_file()))
+        .unwrap_or(false);
+    if !found {
+        eprintln!("rust-analyzer is not installed, skipping");
+        return;
+    }
+    let rig = Rig::new("lsp");
+    fs::write(
+        rig.workspace.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(rig.workspace.join("src")).unwrap();
+    fs::write(
+        rig.workspace.join("src/lib.rs"),
+        "pub struct Shape { pub size: f64 }\n\nimpl Shape {\n    pub fn area(&self) -> f64 { self.size * self.size }\n}\n\npub fn twice(s: &Shape) -> f64 { 2.0 * s.area() }\n",
+    )
+    .unwrap();
+    let ws = Workspace::open(&rig.workspace).unwrap();
+    let code = std::sync::Arc::new(Code::new(Settings::default()));
+    let stop = CancellationToken::new();
+    let out = runtime()
+        .block_on(code.run("code_find", &serde_json::json!({"name": "Shape::area"}), &ws, &stop))
+        .unwrap();
+    assert_eq!(code.launches(), 1);
+    assert!(out.contains("method Shape::area  src/lib.rs:4"), "{out}");
+    assert!(out.contains("fn twice"), "the users are found too: {out}");
+    let (_, home) = rig.run(&format!("ls {} 2>&1", std::env::var("HOME").unwrap_or_default()));
+    assert!(refused(&home), "the home folder stays closed: {home}");
 }
 
 fn network_is_up() -> bool {

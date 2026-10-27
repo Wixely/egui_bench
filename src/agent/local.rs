@@ -1,20 +1,19 @@
 use super::grants::{self, Decision};
-use super::sandbox;
 use super::skillset;
+use super::spawn::{self, Confine};
+use super::tools::{self, number as num, text as pick};
 use super::{Backend, Cx};
 use serde_json::Value;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT: u64 = 120;
 const MAX_TIMEOUT: u64 = 900;
-const MAX_OUTPUT: usize = 30_000;
+const OUTPUT_WAIT_MAX: u64 = 60;
 
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 18] = [
     "bash",
+    "bash_output",
+    "bash_kill",
     "request_access",
     "load_skill",
     "list_files",
@@ -23,6 +22,13 @@ pub const NAMES: [&str; 9] = [
     "edit_file",
     "search_files",
     "workspace",
+    "todo_write",
+    "web_search",
+    "web_fetch",
+    "find_skills",
+    "code_outline",
+    "code_find",
+    "code_diagnostics",
 ];
 
 fn text(args: &Value, key: &str) -> Option<String> {
@@ -37,74 +43,112 @@ fn need(args: &Value, key: &str) -> Result<String, String> {
     text(args, key).ok_or_else(|| format!("missing `{key}`"))
 }
 
-pub fn run(
+pub async fn run(
     backend: &dyn Backend,
     cx: &Cx,
     name: &str,
     args: &Value,
 ) -> Option<Result<String, String>> {
-    if !NAMES.contains(&name) {
-        return backend.call(name, args, cx);
+    if !NAMES.contains(&name) || backend.leave_out().contains(&name) {
+        return backend.call(name, args, cx).await;
     }
-    let toolbox = Toolbox { backend, cx };
-    toolbox.run(name, args)
+    Some(Toolbox { backend, cx }.run(name, args).await)
+}
+
+pub fn job_owner(cx: &Cx) -> String {
+    cx.workspace.root().display().to_string()
 }
 
 struct Toolbox<'a> {
     backend: &'a dyn Backend,
-    cx: &'a Cx<'a>,
+    cx: &'a Cx,
 }
 
 impl Toolbox<'_> {
-    fn run(&self, name: &str, args: &Value) -> Option<Result<String, String>> {
-        if !NAMES.contains(&name) {
-            return None;
+    async fn run(&self, name: &str, args: &Value) -> Result<String, String> {
+        let cx = self.cx;
+        let services = &cx.services;
+        match name {
+            "workspace" => Ok(workspace_note(&cx.workspace)),
+            "request_access" => self.request_access(args).await,
+            "bash" if tools::flag(args, &["background"]).unwrap_or(false) => {
+                let command = need(args, "command")?;
+                let confine = self.confine().await;
+                let handle =
+                    services.jobs.start(&job_owner(cx), cx.workspace.root(), &command, &confine)?;
+                Ok(format!(
+                    "started in the background as {handle}. bash_output {handle} reads what it prints; bash_kill {handle} stops it."
+                ))
+            }
+            "bash" => self.bash(args).await,
+            "bash_output" => match pick(args, &["handle", "id"]) {
+                None => Ok(services.jobs.list(&job_owner(cx))),
+                Some(h) => {
+                    let wait = num(args, &["wait_s", "wait"]).unwrap_or(0) as u64;
+                    let wait = Duration::from_secs(wait.min(OUTPUT_WAIT_MAX));
+                    services.jobs.output(&job_owner(cx), h, wait, &cx.stop).await
+                }
+            },
+            "bash_kill" => {
+                let h = pick(args, &["handle", "id"]).ok_or("missing `handle`")?;
+                services.jobs.kill(&job_owner(cx), h).await
+            }
+            "todo_write" => super::todo::write(args),
+            "web_search" => super::web::search(args, &cx.stop).await,
+            "web_fetch" => {
+                super::web::fetch(args, &cx.workspace, services.reader.as_deref(), &cx.stop).await
+            }
+            "find_skills" => super::skills::find(args, &cx.stop).await,
+            "code_outline" | "code_find" | "code_diagnostics" => {
+                services.code.run(name, args, &cx.workspace, &cx.stop).await
+            }
+            _ => self.file_tool(name, args).await,
         }
-        let ws = self.cx.workspace;
-        Some(match name {
-            "workspace" => Ok(workspace_note(ws)),
-            "request_access" => self.request_access(args),
+    }
+
+    async fn file_tool(&self, name: &str, args: &Value) -> Result<String, String> {
+        let (name, args, ws) = (name.to_string(), args.clone(), self.cx.workspace.clone());
+        let preferred = self.backend.preferred_skills();
+        tokio::task::spawn_blocking(move || match name.as_str() {
             "load_skill" => {
-                let skills = skillset::discover(
-                    &skillset::roots(ws.root()),
-                    &self.backend.preferred_skills(),
-                );
+                let skills = skillset::discover(&skillset::roots(ws.root()), &preferred);
                 skillset::load(
                     &skills,
-                    text(args, "name").as_deref(),
-                    text(args, "file").as_deref(),
+                    text(&args, "name").as_deref(),
+                    text(&args, "file").as_deref(),
                 )
             }
-            "list_files" => ws.list(text(args, "path").as_deref(), number(args, "depth")),
-            "read_file" => need(args, "path")
-                .and_then(|p| ws.read(&p, number(args, "offset"), number(args, "limit"))),
-            "write_file" => need(args, "path")
-                .and_then(|p| ws.write(&p, &text(args, "content").unwrap_or_default())),
+            "list_files" => ws.list(text(&args, "path").as_deref(), number(&args, "depth")),
+            "read_file" => need(&args, "path")
+                .and_then(|p| ws.read(&p, number(&args, "offset"), number(&args, "limit"))),
+            "write_file" => need(&args, "path")
+                .and_then(|p| ws.write(&p, &text(&args, "content").unwrap_or_default())),
             "edit_file" => (|| {
                 let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
                 ws.edit(
-                    &need(args, "path")?,
-                    &need(args, "old")?,
-                    &text(args, "new").unwrap_or_default(),
+                    &need(&args, "path")?,
+                    &need(&args, "old")?,
+                    &text(&args, "new").unwrap_or_default(),
                     all,
                 )
             })(),
             "search_files" => {
-                need(args, "pattern").and_then(|p| ws.search(&p, text(args, "path").as_deref()))
+                need(&args, "pattern").and_then(|p| ws.search(&p, text(&args, "path").as_deref()))
             }
-            "bash" => self.bash(args),
-            _ => return None,
+            other => Err(format!("{other} is not a built-in tool")),
         })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
-    fn request_access(&self, args: &Value) -> Result<String, String> {
+    async fn request_access(&self, args: &Value) -> Result<String, String> {
         let given = need(args, "path")?;
         let write = args.get("write").and_then(Value::as_bool).unwrap_or(false);
         let reason = text(args, "reason").unwrap_or_default();
         if reason.trim().is_empty() {
             return Err("give a reason: the user reads it when deciding".into());
         }
-        let ws = self.cx.workspace;
+        let ws = &self.cx.workspace;
         let real = grants::vet(&given, write, self.backend.config_dir().as_deref(), ws.root())?;
         if real.starts_with(ws.root()) {
             return Ok(format!("{} is inside the workspace already", real.display()));
@@ -116,8 +160,9 @@ impl Toolbox<'_> {
                 if write { " for writing" } else { "" }
             ));
         }
-        let ring = || self.cx.desk.ring();
-        let decision = ws.grants().ask(real.clone(), write, &reason, self.cx.stop, &ring)?;
+        let desk = self.cx.desk.clone();
+        let ring = move || desk.ring();
+        let decision = ws.grants().ask(real.clone(), write, &reason, &self.cx.stop, &ring).await?;
         match decision {
             Decision::Deny => Err(format!("the user said no to {}", real.display())),
             Decision::Read if write => Ok(format!(
@@ -131,50 +176,32 @@ impl Toolbox<'_> {
         }
     }
 
-    fn bash(&self, args: &Value) -> Result<String, String> {
+    async fn confine(&self) -> Confine {
+        let tool_dirs = self.backend.tool_dirs(self.cx).await;
+        let shared = self
+            .cx
+            .workspace
+            .grants()
+            .list()
+            .into_iter()
+            .map(|g| super::sandbox::Shared { path: g.path, write: g.write })
+            .collect();
+        Confine::Sandbox { tool_dirs, shared, env: Vec::new() }
+    }
+
+    async fn bash(&self, args: &Value) -> Result<String, String> {
         let command = need(args, "command")?;
-        if command.trim().is_empty() {
-            return Err("`command` is empty".into());
-        }
-        if !sandbox::supported() {
-            return Err(format!(
-                "bash is unavailable: no sandbox on this machine ({})",
-                sandbox::why_not()
-            ));
-        }
-        let tool_dirs = self.backend.tool_dirs(self.cx);
-        let scratch = scratch_dir()?;
-        let plan = sandbox::Plan {
-            workspace: self.cx.workspace.root().to_path_buf(),
-            scratch: scratch.clone(),
-            tool_dirs,
-            command: command.clone(),
-            shared: self
-                .cx
-                .workspace
-                .grants()
-                .list()
-                .into_iter()
-                .map(|g| sandbox::Shared { path: g.path, write: g.write })
-                .collect(),
-        };
         let timeout = args
             .get("timeout_s")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT)
             .clamp(1, MAX_TIMEOUT);
-        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let confine = self.confine().await;
+        let prepared = spawn::prepare(&command, self.cx.workspace.root(), &confine)
+            .map_err(|e| format!("bash is {e}"))?;
         let started = Instant::now();
-        let out = execute(
-            &me,
-            &sandbox::helper_args(&plan)?,
-            self.cx.workspace.root(),
-            None,
-            Duration::from_secs(timeout),
-            self.cx.stop,
-        );
-        let _ = std::fs::remove_dir_all(&scratch);
-        report(format!("$ {command}\n"), out?, started, timeout)
+        let out = spawn::run(prepared, None, Duration::from_secs(timeout), &self.cx.stop).await?;
+        spawn::report(format!("$ {command}\n"), out, started.elapsed(), timeout)
     }
 }
 
@@ -193,226 +220,15 @@ pub fn workspace_note(ws: &super::workspace::Workspace) -> String {
     out
 }
 
-pub fn report(
-    mut shown: String,
-    out: Output,
-    started: Instant,
-    timeout: u64,
-) -> Result<String, String> {
-    shown.push_str(&out.text);
-    let took = started.elapsed().as_secs_f32();
-    let end = match out.status {
-        Status::Exited(code) => format!("\n[exit {code} in {took:.1}s]"),
-        Status::Signal => format!("\n[killed by a signal after {took:.1}s]"),
-        Status::TimedOut => {
-            format!("\n[killed after {timeout}s: too slow, pass a larger timeout_s]")
-        }
-    };
-    shown.push_str(&end);
-    match out.status {
-        Status::Exited(0) => Ok(shown),
-        _ => Err(shown),
-    }
-}
-
-fn scratch_dir() -> Result<PathBuf, String> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("egui-bench-bash-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    dir.canonicalize().map_err(|e| e.to_string())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Status {
-    Exited(i32),
-    Signal,
-    TimedOut,
-}
-
-pub struct Output {
-    pub text: String,
-    pub status: Status,
-}
-
-pub fn execute(
-    program: &Path,
-    argv: &[String],
-    cwd: &Path,
-    stdin: Option<&str>,
-    timeout: Duration,
-    stop: &AtomicBool,
-) -> Result<Output, String> {
-    let mut cmd = Command::new(program);
-    cmd.args(argv)
-        .current_dir(cwd)
-        .env("NO_COLOR", "1")
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    no_console(&mut cmd);
-    own_group(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", program.display()))?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        let input = input.to_string();
-        std::thread::spawn(move || {
-            let _ = pipe.write_all(input.as_bytes());
-        });
-    }
-    let (done, drained) = std::sync::mpsc::channel::<Vec<u8>>();
-    let mut readers = 0;
-    let mut drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let Some(mut pipe) = pipe else { return };
-        readers += 1;
-        let done = done.clone();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            let _ = done.send(buf);
-        });
-    };
-    drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => {
-                break match s.code() {
-                    Some(c) => Status::Exited(c),
-                    None => Status::Signal,
-                };
-            }
-            Ok(None) => {}
-            Err(e) => return Err(e.to_string()),
-        }
-        if stop.load(Ordering::Relaxed) {
-            stop_group(&mut child);
-            return Err("stopped".into());
-        }
-        if Instant::now() >= deadline {
-            stop_group(&mut child);
-            break Status::TimedOut;
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    };
-    let mut text = String::new();
-    for _ in 0..readers {
-        let Ok(bytes) = drained.recv_timeout(Duration::from_millis(500)) else { break };
-        text.push_str(&String::from_utf8_lossy(&bytes));
-        if !text.ends_with('\n') && !text.is_empty() {
-            text.push('\n');
-        }
-    }
-    Ok(Output { text: clip(text), status })
-}
-
-fn clip(text: String) -> String {
-    if text.len() <= MAX_OUTPUT {
-        return text;
-    }
-    let keep = MAX_OUTPUT / 2;
-    let mut head = keep;
-    while !text.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = text.len() - keep;
-    while !text.is_char_boundary(tail) {
-        tail += 1;
-    }
-    format!("{}\n[... {} bytes left out ...]\n{}", &text[..head], tail - head, &text[tail..])
-}
-
-#[cfg(unix)]
-fn own_group(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn own_group(_cmd: &mut Command) {}
-
-#[cfg(unix)]
-fn stop_group(child: &mut std::process::Child) {
-    let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{}", child.id())])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn stop_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[cfg(windows)]
-fn no_console(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x0800_0000);
-}
-
-#[cfg(not(windows))]
-fn no_console(_cmd: &mut Command) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn v(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_command_runs_in_the_workspace_with_stdin_and_reports_its_exit() {
-        let stop = AtomicBool::new(false);
-        let dir = std::env::temp_dir();
-        let got = execute(
-            Path::new("/bin/sh"),
-            &v(&["-c", "cat; echo err >&2; exit 3"]),
-            &dir,
-            Some("hello\n"),
-            Duration::from_secs(10),
-            &stop,
-        )
-        .unwrap();
-        assert_eq!(got.status, Status::Exited(3));
-        assert!(got.text.contains("hello") && got.text.contains("err"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_slow_command_is_killed() {
-        let stop = AtomicBool::new(false);
-        let started = Instant::now();
-        let got = execute(
-            Path::new("/bin/sh"),
-            &v(&["-c", "sleep 30"]),
-            &std::env::temp_dir(),
-            None,
-            Duration::from_millis(300),
-            &stop,
-        )
-        .unwrap();
-        assert_eq!(got.status, Status::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn long_output_keeps_its_head_and_tail() {
-        let big = format!("{}{}", "a".repeat(40_000), "z".repeat(40_000));
-        let cut = clip(big);
-        assert!(cut.len() < 31_000);
-        assert!(cut.starts_with('a') && cut.ends_with('z'));
-        assert!(cut.contains("bytes left out"));
-    }
+    use std::path::{Path, PathBuf};
 
     struct Stub;
 
+    #[super::super::async_trait]
     impl super::super::Backend for Stub {
         fn app(&self) -> &'static str {
             "egui-bench-test"
@@ -436,8 +252,7 @@ mod tests {
         base: PathBuf,
         ws: super::super::workspace::Workspace,
         elsewhere: PathBuf,
-        desk: super::super::Desk,
-        stop: AtomicBool,
+        cx: Cx,
     }
 
     fn rig(name: &str) -> Rig {
@@ -447,18 +262,17 @@ mod tests {
         std::fs::create_dir_all(base.join("elsewhere")).unwrap();
         std::fs::write(base.join("elsewhere").join("lib.txt"), "library\n").unwrap();
         let (desk, _asks) = super::super::Desk::new(&egui::Context::default());
+        let ws = super::super::workspace::Workspace::open(&base.join("work")).unwrap();
         Rig {
-            ws: super::super::workspace::Workspace::open(&base.join("work")).unwrap(),
+            cx: Cx::new(ws.clone(), desk),
+            ws,
             elsewhere: base.join("elsewhere").canonicalize().unwrap(),
             base,
-            desk,
-            stop: AtomicBool::new(false),
         }
     }
 
     fn call(rig: &Rig, name: &str, args: Value) -> Result<String, String> {
-        let cx = Cx { workspace: &rig.ws, desk: &rig.desk, stop: &rig.stop };
-        run(&Stub, &cx, name, &args).unwrap()
+        super::super::runtime().block_on(run(&Stub, &rig.cx, name, &args)).unwrap()
     }
 
     fn answer(rig: &Rig, decision: Decision) -> std::thread::JoinHandle<()> {
@@ -543,5 +357,88 @@ mod tests {
         assert!(got.unwrap().contains("already shared"));
         assert!(rig.ws.grants().pending().is_empty());
         let _ = std::fs::remove_dir_all(&rig.base);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod jobs_and_more {
+    use super::*;
+    use serde_json::json;
+
+    struct Open;
+
+    #[super::super::async_trait]
+    impl Backend for Open {
+        fn app(&self) -> &'static str {
+            "egui-bench-test"
+        }
+
+        fn brief(&self, _: &std::path::Path, _: &[skillset::Skill]) -> String {
+            String::new()
+        }
+
+        fn welcome(&self) -> super::super::Welcome {
+            super::super::Welcome {
+                kicker: String::new(),
+                title: String::new(),
+                text: String::new(),
+                placeholder: String::new(),
+            }
+        }
+
+        fn leave_out(&self) -> Vec<&'static str> {
+            vec!["web_search"]
+        }
+    }
+
+    fn cx() -> (Cx, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = super::super::workspace::Workspace::open(dir.path()).unwrap();
+        let (desk, _asks) = super::super::Desk::new(&egui::Context::default());
+        (Cx::new(ws, desk), dir)
+    }
+
+    #[tokio::test]
+    async fn todo_write_answers_with_the_list() {
+        let (cx, _d) = cx();
+        let out = run(
+            &Open,
+            &cx,
+            "todo_write",
+            &json!({"items": [{"text": "a", "status": "in_progress"}]}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(out, "[~] a");
+    }
+
+    #[tokio::test]
+    async fn a_tool_the_app_leaves_out_goes_to_the_app_instead() {
+        let (cx, _d) = cx();
+        assert_eq!(run(&Open, &cx, "web_search", &json!({"query": "x"})).await, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_sandbox_bash_says_why() {
+        if super::super::sandbox::supported() {
+            return;
+        }
+        let (cx, _d) = cx();
+        let err = run(&Open, &cx, "bash", &json!({"command": "true"})).await.unwrap().unwrap_err();
+        assert!(err.contains("no sandbox"), "{err}");
+        let err = run(&Open, &cx, "bash", &json!({"command": "true", "background": true}))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("no sandbox"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bash_output_with_no_handle_lists_nothing_at_first() {
+        let (cx, _d) = cx();
+        let out = run(&Open, &cx, "bash_output", &json!({})).await.unwrap().unwrap();
+        assert_eq!(out, "no background commands");
+        assert!(run(&Open, &cx, "bash_kill", &json!({})).await.unwrap().is_err());
     }
 }
