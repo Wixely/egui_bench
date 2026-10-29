@@ -304,3 +304,30 @@ fn the_summary_says_which_server_and_tool() {
     assert_eq!(summary(&json!({ "server": "ha" })).unwrap(), "ha: tools");
     assert_eq!(summary(&json!({ "server": "ha", "tool": "light" })).unwrap(), "ha light");
 }
+
+#[test]
+fn a_server_with_many_tools_is_listed_a_line_a_tool_within_the_budget() {
+    let tools: Vec<client::Tool> = (0..137)
+        .map(|i| client::Tool {
+            name: format!("tool_{i}"),
+            about: format!("Tool number {i}. {}", "It does a great deal of things. ".repeat(12)),
+            schema: json!({ "type": "object", "required": ["a"], "properties": {
+                "a": { "type": "string", "description": "The first argument, explained at length.".repeat(4) },
+                "b": { "type": "integer" },
+            } }),
+        })
+        .collect();
+    let out = listing_of("kicad", "kicad-mcp-server 1.0.0", "", &tools);
+    assert!(out.len() <= LISTING_CHARS, "{} chars", out.len());
+    assert!(
+        out.starts_with(
+            "kicad (kicad-mcp-server 1.0.0) has 137 tools, too many to describe in full"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("\n- tool_0(a: string, b?: integer): Tool number 0\n"), "{out}");
+    assert!(out.contains("- tool_136("), "every tool is named");
+    assert!(!out.contains("explained at length"));
+    let few = listing_of("fake", "", "", &tools[..2]);
+    assert!(few.contains("explained at length"), "a short list is described in full");
+}

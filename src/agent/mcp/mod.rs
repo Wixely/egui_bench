@@ -20,6 +20,8 @@ const LIST: Duration = Duration::from_secs(60);
 const CALL: Duration = Duration::from_secs(300);
 const ABOUT_CHARS: usize = 400;
 const PARAM_CHARS: usize = 160;
+const SHORT_CHARS: usize = 120;
+pub const LISTING_CHARS: usize = 24_000;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -168,34 +170,42 @@ fn type_of(schema: &Value) -> String {
     }
 }
 
-pub fn describe(tool: &client::Tool) -> String {
-    let props = tool.schema.get("properties").and_then(Value::as_object);
+fn arguments(tool: &client::Tool) -> Vec<(&String, &Value, bool)> {
     let required: Vec<&str> = tool
         .schema
         .get("required")
         .and_then(Value::as_array)
         .map(|r| r.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let mut props: Vec<(&String, &Value)> = props.into_iter().flatten().collect();
-    props.sort_by_key(|(name, _)| !required.contains(&name.as_str()));
-    let mut params = Vec::new();
-    let mut notes = Vec::new();
-    for (name, p) in props {
-        let mark = if required.contains(&name.as_str()) { "" } else { "?" };
-        params.push(format!("{name}{mark}: {}", type_of(p)));
-        if let Some(d) =
-            p.get("description").and_then(Value::as_str).filter(|d| !d.trim().is_empty())
-        {
-            notes.push(format!("    {name}: {}", clip(d, PARAM_CHARS)));
-        }
-    }
-    let mut out = format!("- {}({})", tool.name, params.join(", "));
+    let props = tool.schema.get("properties").and_then(Value::as_object);
+    let mut out: Vec<(&String, &Value, bool)> = props
+        .into_iter()
+        .flatten()
+        .map(|(name, p)| (name, p, required.contains(&name.as_str())))
+        .collect();
+    out.sort_by_key(|(_, _, needed)| !needed);
+    out
+}
+
+fn signature(tool: &client::Tool) -> String {
+    let params: Vec<String> = arguments(tool)
+        .into_iter()
+        .map(|(name, p, needed)| format!("{name}{}: {}", if needed { "" } else { "?" }, type_of(p)))
+        .collect();
+    format!("{}({})", tool.name, params.join(", "))
+}
+
+pub fn describe(tool: &client::Tool) -> String {
+    let mut out = format!("- {}", signature(tool));
     if !tool.about.is_empty() {
         out.push_str(&format!(": {}", clip(&tool.about, ABOUT_CHARS)));
     }
-    for n in notes {
-        out.push('\n');
-        out.push_str(&n);
+    for (name, p, _) in arguments(tool) {
+        if let Some(d) =
+            p.get("description").and_then(Value::as_str).filter(|d| !d.trim().is_empty())
+        {
+            out.push_str(&format!("\n    {name}: {}", clip(d, PARAM_CHARS)));
+        }
     }
     out
 }
@@ -515,18 +525,50 @@ impl Mcp {
 }
 
 fn tool_listing(client: &Client, tools: &[client::Tool]) -> String {
-    let title = match client.title.as_str() {
-        "" => client.name.clone(),
-        t => format!("{} ({t})", client.name),
+    listing_of(&client.name, &client.title, &client.instructions, tools)
+}
+
+fn first_sentence(text: &str) -> String {
+    let one = clip(text, SHORT_CHARS);
+    match one.split_once(". ") {
+        Some((head, _)) => head.to_string(),
+        None => one.trim_end_matches('.').to_string(),
+    }
+}
+
+pub fn listing_of(name: &str, title: &str, instructions: &str, tools: &[client::Tool]) -> String {
+    let title = match title {
+        "" => name.to_string(),
+        t => format!("{name} ({t})"),
     };
-    let mut out = format!("{title} has {} tools:", tools.len());
+    let said = match instructions {
+        "" => String::new(),
+        text => format!("\n\nThe server says:\n{}", clip(text, 1500)),
+    };
+    let full: Vec<String> = tools.iter().map(describe).collect();
+    let length: usize = full.iter().map(|l| l.len() + 1).sum();
+    if length + said.len() + title.len() + 40 <= LISTING_CHARS {
+        return format!("{title} has {} tools:\n{}{said}", tools.len(), full.join("\n"));
+    }
+    let mut out = format!(
+        "{title} has {} tools, too many to describe in full; call mcp with server, tool and schema: true to see one's arguments:",
+        tools.len()
+    );
     for t in tools {
-        out.push('\n');
-        out.push_str(&describe(t));
+        let line = match first_sentence(&t.about).as_str() {
+            "" => format!("\n- {}", signature(t)),
+            about => format!("\n- {}: {about}", signature(t)),
+        };
+        if out.len() + line.len() + said.len() > LISTING_CHARS {
+            let rest: Vec<&str> =
+                tools.iter().skip_while(|o| o.name != t.name).map(|o| o.name.as_str()).collect();
+            out.push_str(&format!("\n- and {}", rest.join(", ")));
+            break;
+        }
+        out.push_str(&line);
     }
-    if !client.instructions.is_empty() {
-        out.push_str(&format!("\n\nThe server says:\n{}", clip(&client.instructions, 1500)));
-    }
+    let room = LISTING_CHARS.saturating_sub(out.len());
+    out.push_str(&said.chars().take(room).collect::<String>());
     out
 }
 
