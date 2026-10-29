@@ -6,6 +6,8 @@ pub mod http;
 pub mod jobs;
 pub mod local;
 pub mod lsp;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod pane;
 pub mod sandbox;
 pub mod settings;

@@ -192,6 +192,37 @@ The tools are usable without the window too, by an agent of your own: `agent::lo
 `agent::code::Code`, `agent::jobs::Jobs` and `agent::web` work alone. `spawn::Confine::Open` runs
 commands and language servers without the sandbox, for a host that trusts its agent.
 
+#### MCP servers (feature `mcp`)
+
+`agent::mcp::Mcp` reaches the MCP servers the user set up, over stdio or streamable HTTP, behind
+one `mcp` tool so a dozen servers do not put hundreds of tools in every request. With no arguments
+the tool lists the servers; with `server` it starts that one and lists its tools and their
+arguments; with `server`, `tool` and `args` it calls one. A server starts the first time it is
+used, in the workspace, and stops after 30 idle minutes.
+
+Servers are read from `~/.agents/mcp.json`, then from each name in `Settings::project_files`
+inside the workspace (a later file replaces a server of the same name), in the format most
+clients share:
+
+```json
+{
+  "mcpServers": {
+    "kicad": { "command": "node", "args": ["~/mcp/kicad/index.js"], "env": { "KEY": "${KICAD_KEY}" } },
+    "docs": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" } }
+  }
+}
+```
+
+`${VAR}` and `${VAR:-default}` are filled in from the environment, `bearerToken` or
+`bearerTokenEnv` becomes an `Authorization` header, `disabled` switches a server off and `timeout`
+sets a call's limit in seconds (300 by default). The old SSE transport and OAuth sign-in are not
+supported. MCP servers run as the user, outside the sandbox, so only configure ones you trust.
+
+A bench app adds `agent::mcp::tool(Arc::new(Mcp::new(settings)))` to its toolkit. A host with its
+own loop calls `Mcp::run`, which gives back the text and any pictures (`Image::part()` is the
+`image_url` content part to send in the next user message), and `Mcp::section` for a line for
+the system prompt naming the servers.
+
 #### Voice for the agent window (`voice`, and feature `speech`)
 
 Speech both ways, for a chat you talk to and that talks back. The helpers need no feature at all, and with `agent` you also get a client, with nothing heavy: `voice::Server { url, key }` (with `agent`) posts a take to any server with

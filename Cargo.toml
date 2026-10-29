@@ -1,6 +1,6 @@
 [package]
 name = "egui_bench"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT AND OFL-1.1"
@@ -17,6 +17,7 @@ update = ["dep:ureq", "dep:serde_json", "dep:flate2", "dep:tar", "dep:sha2", "de
 markdown = ["dep:pulldown-cmark"]
 agent = ["markdown", "dep:ureq", "dep:serde", "dep:serde_json", "dep:dirs", "dep:tokio", "dep:tokio-util", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:async-trait", "dep:futures-util", "dep:scraper", "dep:url", "dep:ignore", "dep:base64"]
 sandbox = ["agent", "dep:nono"]
+mcp = ["agent"]
 # Whisper and Kokoro, run in this process through candle. Pulls in candle, so it is off unless asked for.
 speech = ["agent", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:byteorder", "dep:tracing", "dep:rand", "dep:rand_distr"]
 # Run them on an NVIDIA card when there is one. The CUDA runtime is loaded when first needed, so a
@@ -99,7 +100,7 @@ name = "viewer3d"
 required-features = ["viewer3d"]
 
 [package.metadata.docs.rs]
-features = ["viewer3d", "update", "agent", "sandbox", "speech"]
+features = ["viewer3d", "update", "agent", "sandbox", "speech", "mcp"]
 
 [[example]]
 name = "say"
