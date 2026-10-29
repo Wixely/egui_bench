@@ -30,6 +30,17 @@ struct Job {
     _scratch: Option<Arc<Scratch>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    pub handle: String,
+    pub command: String,
+    pub running: bool,
+    pub exit: Option<i32>,
+    pub seconds: u64,
+    pub dropped: usize,
+    pub text: String,
+}
+
 #[derive(Clone, Default)]
 pub struct Jobs(Arc<Mutex<HashMap<(Owner, String), Job>>>);
 
@@ -174,6 +185,28 @@ impl Jobs {
             .join("\n")
     }
 
+    pub fn snapshot(&self, session: &str) -> Vec<Snapshot> {
+        let jobs = lock(&self.0);
+        let mut rows: Vec<_> = jobs.iter().filter(|((s, _), _)| s == session).collect();
+        rows.sort_by_key(|((_, h), _)| {
+            h.strip_prefix("job-").and_then(|n| n.parse::<usize>().ok()).unwrap_or(usize::MAX)
+        });
+        rows.into_iter()
+            .map(|((_, h), j)| {
+                let o = lock(&j.out);
+                Snapshot {
+                    handle: h.clone(),
+                    command: j.command.clone(),
+                    running: o.exit.is_none(),
+                    exit: o.exit.flatten(),
+                    seconds: j.started.elapsed().as_secs(),
+                    dropped: o.dropped,
+                    text: String::from_utf8_lossy(&o.bytes).into_owned(),
+                }
+            })
+            .collect()
+    }
+
     pub async fn output(
         &self,
         session: &str,
@@ -268,6 +301,23 @@ mod tests {
         let last = jobs.output(SID, &h, Duration::from_secs(1), &stop).await.unwrap();
         assert!(last.contains("exited"), "{last}");
         assert!(jobs.list(SID).contains("exited"));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_shows_all_output_without_consuming_it() {
+        let jobs = Jobs::default();
+        let dir = tempfile::tempdir().unwrap();
+        let stop = CancellationToken::new();
+        let h = jobs.start(SID, dir.path(), "echo up; sleep 30", &open()).unwrap();
+        jobs.output(SID, &h, Duration::from_secs(5), &stop).await.unwrap();
+        let seen = jobs.snapshot(SID);
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].running && seen[0].text.contains("up"), "{seen:?}");
+        assert_eq!(seen[0].handle, "job-1");
+        assert_eq!(jobs.snapshot(SID)[0].text, seen[0].text);
+        assert!(jobs.snapshot("other").is_empty());
+        jobs.kill(SID, &h).await.unwrap();
+        assert!(!jobs.snapshot(SID)[0].running);
     }
 
     #[tokio::test]
