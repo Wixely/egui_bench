@@ -44,11 +44,13 @@ impl Browser {
 
     pub fn show(&mut self, ctx: &egui::Context) -> Picked {
         let mut picked = Picked::Browsing;
-        let modal =
-            egui::Modal::new(egui::Id::unique(("egui_bench_browser", &self.title))).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique(("egui_bench_browser", &self.title))).show(
+            ctx,
+            |ui| {
                 ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(120.0)));
                 picked = self.body(ui);
-            });
+            },
+        );
         match picked {
             Picked::Browsing if modal.should_close() => Picked::Cancelled,
             picked => picked,

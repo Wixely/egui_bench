@@ -225,3 +225,19 @@ fn markdown_wraps() {
     }
     done();
 }
+
+#[test]
+fn a_choice_has_an_accessible_name() {
+    let mut picked = 1u8;
+    let mut harness =
+        egui_kittest::Harness::builder().with_size(Vec2::new(300.0, 120.0)).build_ui(move |ui| {
+            install(ui.ctx());
+            choice(
+                ui,
+                "scope_dev",
+                &mut picked,
+                vec![(0u8, "first".to_string()), (1, "second".to_string())],
+            );
+        });
+    harness.run();
+}

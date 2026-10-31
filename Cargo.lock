@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "egui_bench"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",

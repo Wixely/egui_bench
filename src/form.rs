@@ -87,7 +87,8 @@ pub fn choice<T: PartialEq + Clone>(
     let options: Vec<(T, String)> = options.into_iter().collect();
     let shown = options.iter().find(|(v, _)| v == picked).map(|(_, l)| l.clone());
     let mut changed = false;
-    egui::ComboBox::from_id_salt(id)
+    let name = format!("{id:?}").trim_matches('"').replace(['_', '-'], " ");
+    let combo = egui::ComboBox::from_id_salt(id)
         .selected_text(shown.unwrap_or_default())
         .width(ui.available_width())
         .truncate()
@@ -100,6 +101,7 @@ pub fn choice<T: PartialEq + Clone>(
                 }
             }
         });
+    ui.ctx().accesskit_node_builder(combo.response.id, |node| node.set_label(name.clone()));
     changed
 }
 
