@@ -241,3 +241,14 @@ fn a_choice_has_an_accessible_name() {
         });
     harness.run();
 }
+
+#[test]
+fn a_secret_field_has_an_accessible_name() {
+    let mut text = String::new();
+    let mut harness =
+        egui_kittest::Harness::builder().with_size(Vec2::new(300.0, 120.0)).build_ui(move |ui| {
+            install(ui.ctx());
+            secret(ui, &mut text);
+        });
+    harness.run();
+}

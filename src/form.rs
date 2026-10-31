@@ -139,6 +139,7 @@ fn field_of(
     width: f32,
 ) -> Response {
     let font = theme::figure(12.5);
+    let hint_text = hint.to_string();
     let hint = egui::RichText::new(hint).font(font.clone()).color(LEGEND.gamma_multiply(0.6));
     egui::Frame::NONE
         .fill(WELL)
@@ -158,7 +159,12 @@ fn field_of(
                 .hint_text(hint)
                 .password(secret)
                 .desired_width(if width.is_finite() { width - 12.0 } else { width });
-            clipboard_menu(ui.add(edit))
+            let response = ui.add(edit);
+            let name = if hint_text.is_empty() && secret { "secret" } else { hint_text.as_str() };
+            if !name.is_empty() {
+                ui.ctx().accesskit_node_builder(response.id, |node| node.set_label(name));
+            }
+            clipboard_menu(response)
         })
         .inner
 }
