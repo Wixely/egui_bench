@@ -59,7 +59,7 @@ impl Key {
     }
 
     pub fn id_salt(mut self, salt: impl std::hash::Hash + std::fmt::Debug) -> Key {
-        self.id = Some(egui::Id::new(salt));
+        self.id = Some(egui::Id::unique(salt));
         self
     }
 
@@ -202,6 +202,7 @@ pub fn focus_ring(ui: &Ui, resp: &Response, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
     use egui::{Pos2, Rect};
 
     fn frame(ctx: &egui::Context, events: Vec<egui::Event>, enabled: bool) -> (bool, Rect) {
@@ -209,7 +210,7 @@ mod tests {
         let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
         let mut clicked = false;
         let mut at = Rect::NOTHING;
-        let _ = ctx.run_ui(input, |ui| {
+        let _ = ctx.run_frame(input, |ui| {
             let r = ui.add(Key::new("launch").solid(VALUE).enabled(enabled));
             clicked = r.clicked();
             at = r.rect;
@@ -245,7 +246,7 @@ mod tests {
         crate::install(&ctx);
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
         let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
-        let out = ctx.run_ui(input, |ui| {
+        let out = ctx.run_frame(input, |ui| {
             let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(300.0, KEY_H));
             busy(ui, rect, Some(0.5), "downloading 7 of 14 MB", READOUT);
         });

@@ -680,6 +680,7 @@ fn cell(ui: &mut Ui, spans: &[Span], size: f32, bold_all: bool, extend: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
 
     fn found(text: &str) -> Vec<&str> {
         urls_in(text).into_iter().map(|r| &text[r]).collect()
@@ -906,10 +907,10 @@ mod tests {
         crate::install(&ctx);
         let mut cache = Cache::default();
         let text = "# H\n\npara **b** [l](https://x.y) `c`\n\n- a\n- b\n  1. n\n\n> q\n\n```rs\nfn x() {}\n```\n\n| a | b |\n|-|-|\n| 1 | 2 |\n\n---\n";
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
             show(ui, &mut cache, text, 0);
         });
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let _ = ctx.run_frame(egui::RawInput::default(), |ui| {
             show(ui, &mut cache, text, 0);
         });
     }

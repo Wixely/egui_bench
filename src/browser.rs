@@ -45,7 +45,7 @@ impl Browser {
     pub fn show(&mut self, ctx: &egui::Context) -> Picked {
         let mut picked = Picked::Browsing;
         let modal =
-            egui::Modal::new(egui::Id::new(("egui_bench_browser", &self.title))).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique(("egui_bench_browser", &self.title))).show(ctx, |ui| {
                 ui.set_width(560.0_f32.min((ctx.content_rect().width() - 48.0).max(120.0)));
                 picked = self.body(ui);
             });
@@ -138,6 +138,7 @@ pub fn entries(dir: &Path, suffixes: &[String]) -> Vec<(bool, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
     use egui::{Pos2, Rect, Vec2};
 
     fn scratch(name: &str) -> PathBuf {
@@ -157,7 +158,7 @@ mod tests {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
         let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
         let mut picked = Picked::Browsing;
-        let out = ctx.run_ui(input, |ui| picked = b.show(ui.ctx()));
+        let out = ctx.run_frame(input, |ui| picked = b.show(ui.ctx()));
         let texts = out
             .shapes
             .iter()

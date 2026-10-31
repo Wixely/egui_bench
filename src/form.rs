@@ -203,13 +203,15 @@ pub fn footer(ui: &mut Ui, buttons: impl FnOnce(&mut Ui)) {
 
 #[cfg(test)]
 mod tests {
+    use crate::RunFrame;
+
     #[test]
     fn select_all_covers_every_character_across_lines() {
         let ctx = egui::Context::default();
         let mut text = String::from("héllo\nworld");
         let mut selected = None;
         for pass in 0..2 {
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = ctx.run_frame(Default::default(), |ui| {
                 let out = egui::TextEdit::multiline(&mut text).show(ui);
                 if pass == 0 {
                     out.response.request_focus();
@@ -234,7 +236,7 @@ mod tests {
             if pass == 1 {
                 input.events.push(egui::Event::Paste(".92".into()));
             }
-            let _ = ctx.run_ui(input, |ui| {
+            let _ = ctx.run_frame(input, |ui| {
                 let response = ui.text_edit_singleline(&mut text);
                 if pass == 0 {
                     response.request_focus();

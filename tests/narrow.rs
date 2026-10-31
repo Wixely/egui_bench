@@ -16,11 +16,12 @@ fn overflow(add: impl Fn(&mut egui::Ui)) -> f32 {
     let mut right = 0.0f32;
     for _ in 0..3 {
         let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
-        let _ = ctx.run_ui(input, |ui| {
+        let mut out = ctx.run_ui(input, |ui| {
             ui.set_max_width(WIDTH);
             add(ui);
             right = ui.min_rect().right();
         });
+        out.textures_delta.clear();
     }
     right - WIDTH
 }

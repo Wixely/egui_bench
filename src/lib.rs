@@ -47,3 +47,17 @@ pub mod prelude {
     };
     pub use crate::trace::{Scale, Trace};
 }
+
+#[cfg(test)]
+pub(crate) trait RunFrame {
+    fn run_frame(&self, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) -> egui::FullOutput;
+}
+
+#[cfg(test)]
+impl RunFrame for egui::Context {
+    fn run_frame(&self, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let mut out = self.run_ui(input, f);
+        out.textures_delta.clear();
+        out
+    }
+}

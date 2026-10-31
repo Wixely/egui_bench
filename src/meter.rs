@@ -227,6 +227,7 @@ pub fn bar(p: &egui::Painter, r: Rect, fraction: f32, tint: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
 
     fn wheel_over(value: f32, at: Pos2, notches: f32) -> f32 {
         let ctx = egui::Context::default();
@@ -237,13 +238,14 @@ mod tests {
             if frame == 1 {
                 events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Line,
+                    source: egui::MouseWheelSource::Wheel,
                     delta: Vec2::new(0.0, notches),
                     phase: egui::TouchPhase::Move,
                     modifiers: egui::Modifiers::NONE,
                 });
             }
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| {
+            let _ = ctx.run_frame(input, |ui| {
                 ui.add(Fader::new(&mut v, 0.0).width(200.0));
             });
         }

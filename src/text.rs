@@ -241,12 +241,13 @@ pub fn help(ui: &mut egui::Ui, text: &str) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
 
     #[test]
     fn spans_of_different_sizes_share_a_baseline() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = ctx.run_frame(Default::default(), |_| {});
         let job = Line::new().legend("squelch").value("-42 dBFS").size(11.0).job;
         let galley = ctx.fonts_mut(|f| f.layout_job(job));
         assert_eq!(galley.rows.len(), 1, "a short line wrapped");
@@ -260,7 +261,7 @@ mod tests {
     fn a_hanging_value_wraps_inside_its_column_and_keeps_to_the_width() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let _ = ctx.run_frame(Default::default(), |ui| {
             ui.set_max_width(300.0);
             let long = "435.3350 MHz GFSK (Mode U - GFSK9k6 - AX.25 Beacon and Ham Payload)";
             let short = Line::new().legend("level").hanging(ui, 98.0, Line::new().value("-7 dB"));
@@ -275,7 +276,7 @@ mod tests {
     fn a_column_lands_the_value_where_it_was_asked_for() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let _ = ctx.run_frame(Default::default(), |ui| {
             let job = Line::new().legend("mode").column(ui, 90.0).value("FM").job;
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             let x = galley.rows[0].glyphs.last().unwrap().pos.x;

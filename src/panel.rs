@@ -243,7 +243,7 @@ pub fn tabs<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, options: &[(T, &s
         let top = strip.top() + row as f32 * (TAB_H + MARK_H);
         let h = galley.size().y.max(TAB_H);
         let hit = Rect::from_min_size(Pos2::new(left + x, top), Vec2::new(w, h));
-        let r = ui.interact(hit, ui.id().with(("tab", i)), Sense::click());
+        let r = ui.interact(hit, ui.scope_id().with(("tab", i)), Sense::click());
         let on = *current == *value;
         if r.clicked() && !on {
             *current = *value;
@@ -370,7 +370,7 @@ pub fn segments<T: PartialEq + Copy>(
             Pos2::new(left + x, top + row as f32 * (crate::key::KEY_H - 1.0)),
             Vec2::new(w, h.max(crate::key::KEY_H)),
         );
-        let resp = ui.interact(rect, ui.id().with(("segment", n)), Sense::click());
+        let resp = ui.interact(rect, ui.scope_id().with(("segment", n)), Sense::click());
         if ui.is_rect_visible(rect) {
             let p = ui.painter();
             let fill = if on {
@@ -416,6 +416,7 @@ pub fn segments<T: PartialEq + Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
 
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Pick {
@@ -427,7 +428,7 @@ mod tests {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0));
         let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
         let mut rects = Vec::new();
-        let out = ctx.run_ui(input, |ui| {
+        let out = ctx.run_frame(input, |ui| {
             segments(ui, pick, &[(Pick::All, "all", Some(6)), (Pick::Some, "some", Some(2))]);
         });
         for c in &out.shapes {

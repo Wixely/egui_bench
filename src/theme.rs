@@ -125,6 +125,7 @@ pub fn install(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunFrame;
 
     fn luma(c: Color32) -> f32 {
         0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
@@ -190,7 +191,7 @@ mod tests {
     fn every_named_family_is_bound() {
         let ctx = egui::Context::default();
         install(&ctx);
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let _ = ctx.run_frame(Default::default(), |ui| {
             for f in [legend_font(12.0), figure(12.0), mono(12.0)] {
                 let _ = ui.painter().layout_no_wrap("0".into(), f, VALUE);
             }

@@ -493,7 +493,7 @@ fn pipeline(
             module,
             entry_point: Some(vertex),
             compilation_options: Default::default(),
-            buffers: &[buffer],
+            buffers: &[Some(buffer)],
         },
         fragment: Some(wgpu::FragmentState {
             module,
@@ -1456,7 +1456,7 @@ fn read_back(state: &State, canvas: &Canvas) -> ColorImage {
     let slice = buffer.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("readback buffer is mapped");
     let pixels = (0..h as usize)
         .flat_map(|y| {
             let line = &data[y * row as usize..][..w as usize * 4];

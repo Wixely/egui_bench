@@ -14,7 +14,7 @@ pub fn overlay(
     tint: Color32,
 ) {
     let screen = ctx.content_rect();
-    egui::Area::new(Id::new("egui_bench_drop"))
+    egui::Area::new(Id::unique("egui_bench_drop"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .interactable(false)
