@@ -3,8 +3,10 @@ use crate::panel::toggle;
 use crate::text::hint;
 use crate::theme::{LEGEND, READOUT, VALUE};
 use egui::{RichText, Ui};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Revision {
@@ -34,132 +36,243 @@ impl Revision {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err.trim().to_string());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 fn folder(path: &Path) -> PathBuf {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if path.is_dir() { path } else { path.parent().map(Path::to_path_buf).unwrap_or(path) }
 }
 
-fn toplevel(path: &Path) -> Result<PathBuf, String> {
-    let top = git(&folder(path), &["rev-parse", "--show-toplevel"])?;
-    let top = PathBuf::from(top.trim());
-    Ok(std::fs::canonicalize(&top).unwrap_or(top))
+fn open_repo(path: &Path) -> Result<gix::ThreadSafeRepository, String> {
+    gix::ThreadSafeRepository::discover(folder(path)).map_err(|e| e.to_string())
+}
+
+fn top_of(repo: &gix::Repository) -> Result<PathBuf, String> {
+    let top = repo.workdir().ok_or("a bare repository has no files to open")?;
+    Ok(std::fs::canonicalize(top).unwrap_or_else(|_| top.to_path_buf()))
+}
+
+fn relative_to(top: &Path, path: &Path) -> Result<PathBuf, String> {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.strip_prefix(top).map(Path::to_path_buf).map_err(|_| "outside the repository".to_string())
+}
+
+fn names_by_commit(repo: &gix::Repository) -> HashMap<gix::ObjectId, Vec<String>> {
+    let mut out: HashMap<gix::ObjectId, Vec<String>> = HashMap::new();
+    let Ok(platform) = repo.references() else { return out };
+    let Ok(all) = platform.all() else { return out };
+    for reference in all.flatten() {
+        let mut reference = reference;
+        let name = reference.name().shorten().to_string();
+        if let Ok(id) = reference.peel_to_id() {
+            out.entry(id.detach()).or_default().push(name);
+        }
+    }
+    out
+}
+
+fn entry_at(tree: &gix::Tree<'_>, rel: &Path) -> Option<gix::ObjectId> {
+    if rel.as_os_str().is_empty() {
+        return Some(tree.id);
+    }
+    tree.clone().lookup_entry_by_path(rel).ok().flatten().map(|e| e.object_id())
 }
 
 pub fn list(path: &Path, limit: usize) -> Result<Vec<Revision>, String> {
-    let n = format!("-n{limit}");
-    let out = git(
-        &folder(path),
-        &[
-            "log",
-            &n,
-            "--format=%H%x1f%h%x1f%cs%x1f%an%x1f%D%x1f%s%x1e",
-            "--",
-            ".",
-        ],
-    )?;
-    Ok(out.split('\u{1e}').filter_map(parse).collect())
-}
-
-fn parse(record: &str) -> Option<Revision> {
-    let mut f = record.trim_start_matches('\n').split('\u{1f}');
-    let sha = f.next().filter(|s| !s.is_empty())?.to_string();
-    let short = f.next()?.to_string();
-    let date = f.next()?.to_string();
-    let author = f.next()?.to_string();
-    let refs = f
-        .next()?
-        .split(", ")
-        .filter(|r| !r.is_empty())
-        .map(|r| r.trim_start_matches("HEAD -> ").trim_start_matches("tag: ").to_string())
-        .filter(|r| r != "HEAD")
-        .collect();
-    let subject = f.next()?.to_string();
-    Some(Revision { sha, short, date, author, refs, subject })
-}
-
-pub fn snapshot_root(path: &Path, sha: &str) -> Result<PathBuf, String> {
-    let top = toplevel(path)?;
-    let full = git(&top, &["rev-parse", "--verify", &format!("{sha}^{{commit}}")])?;
-    let full = full.trim();
-    let tag = format!("{:016x}", fnv(top.to_string_lossy().as_bytes()));
-    let dest = std::env::temp_dir().join("bench-revisions").join(format!("{tag}-{full}"));
-    if dest.is_dir() {
-        return Ok(dest);
+    let repo = open_repo(path)?.to_thread_local();
+    let top = top_of(&repo)?;
+    let rel = relative_to(&top, &folder(path))?;
+    let names = names_by_commit(&repo);
+    let head = repo.head_id().map_err(|e| e.to_string())?;
+    let walk = repo.rev_walk([head.detach()]).all().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for info in walk {
+        let info = info.map_err(|e| e.to_string())?;
+        let commit = info.object().map_err(|e| e.to_string())?;
+        let tree = commit.tree().map_err(|e| e.to_string())?;
+        let here = entry_at(&tree, &rel);
+        let before = match commit.parent_ids().next() {
+            Some(parent) => {
+                let parent = repo.find_commit(parent).map_err(|e| e.to_string())?;
+                entry_at(&parent.tree().map_err(|e| e.to_string())?, &rel)
+            }
+            None => None,
+        };
+        if here.is_none() || here == before {
+            continue;
+        }
+        let id = commit.id;
+        let sha = id.to_string();
+        let message = commit.message().map_err(|e| e.to_string())?;
+        let author = commit.author().map(|a| a.name.to_string()).unwrap_or_default();
+        let date = commit
+            .time()
+            .map(|t| t.format(gix::date::time::format::SHORT).unwrap_or_default())
+            .unwrap_or_default();
+        let mut refs = names.get(&id).cloned().unwrap_or_default();
+        refs.sort();
+        out.push(Revision {
+            short: sha[..7.min(sha.len())].to_string(),
+            sha,
+            date,
+            author,
+            refs,
+            subject: message.title.to_string().trim().to_string(),
+        });
+        if out.len() >= limit {
+            break;
+        }
     }
-    let partial = dest.with_extension("partial");
-    let _ = std::fs::remove_dir_all(&partial);
-    std::fs::create_dir_all(&partial).map_err(|e| e.to_string())?;
-    let result = extract(&top, full, &partial);
-    if let Err(e) = result {
-        let _ = std::fs::remove_dir_all(&partial);
-        return Err(e);
-    }
-    std::fs::rename(&partial, &dest).map_err(|e| e.to_string())?;
-    Ok(dest)
+    Ok(out)
 }
 
-fn extract(top: &Path, sha: &str, into: &Path) -> Result<(), String> {
-    let mut archive = Command::new("git")
-        .arg("-C")
-        .arg(top)
-        .args(["archive", "--format=tar", sha])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("git: {e}"))?;
-    let tar = Command::new("tar")
-        .arg("-x")
-        .arg("-C")
-        .arg(into)
-        .stdin(archive.stdout.take().ok_or("git archive has no output")?)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("tar: {e}"))?;
-    let git = archive.wait_with_output().map_err(|e| e.to_string())?;
-    if !git.status.success() {
-        return Err(String::from_utf8_lossy(&git.stderr).trim().to_string());
-    }
-    if !tar.status.success() {
-        return Err(String::from_utf8_lossy(&tar.stderr).trim().to_string());
-    }
-    Ok(())
+pub struct Snapshot {
+    repo: gix::ThreadSafeRepository,
+    top: PathBuf,
+    sha: String,
+    files: BTreeMap<PathBuf, gix::ObjectId>,
+    dirs: BTreeSet<PathBuf>,
+    cache: Mutex<HashMap<PathBuf, Arc<[u8]>>>,
 }
 
-fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
-}
-
-pub fn checkout(path: &Path, sha: &str) -> Result<PathBuf, String> {
-    let top = toplevel(path)?;
-    let root = snapshot_root(path, sha)?;
-    let path = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    let rel = path.strip_prefix(&top).map_err(|_| "outside the repository".to_string())?;
-    let target = root.join(rel);
-    if !target.exists() {
-        return Err(format!("{} does not exist at {}", rel.display(), &sha[..sha.len().min(8)]));
+impl Snapshot {
+    pub fn open(path: &Path, sha: &str) -> Result<Snapshot, String> {
+        let safe = open_repo(path)?;
+        let repo = safe.to_thread_local();
+        let top = top_of(&repo)?;
+        let id = repo
+            .rev_parse_single(sha)
+            .map_err(|e| e.to_string())?
+            .object()
+            .map_err(|e| e.to_string())?
+            .peel_to_commit()
+            .map_err(|e| e.to_string())?;
+        let tree = id.tree().map_err(|e| e.to_string())?;
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        tree.traverse().breadthfirst(&mut recorder).map_err(|e| e.to_string())?;
+        let mut files = BTreeMap::new();
+        let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        dirs.insert(PathBuf::new());
+        for entry in recorder.records {
+            let rel = PathBuf::from(entry.filepath.to_string());
+            if entry.mode.is_tree() {
+                dirs.insert(rel);
+            } else if entry.mode.is_blob() || entry.mode.is_link() {
+                files.insert(rel, entry.oid);
+            }
+        }
+        let snapshot = Snapshot {
+            repo: safe,
+            top,
+            sha: id.id.to_string(),
+            files,
+            dirs,
+            cache: Mutex::default(),
+        };
+        if !snapshot.is_file(path) && !snapshot.is_dir(path) {
+            return Err(format!("{} does not exist at {}", path.display(), snapshot.short()));
+        }
+        Ok(snapshot)
     }
-    Ok(target)
+
+    pub fn short(&self) -> &str {
+        &self.sha[..self.sha.len().min(8)]
+    }
+
+    pub fn top(&self) -> &Path {
+        &self.top
+    }
+
+    fn relative(&self, path: &Path) -> Option<PathBuf> {
+        let tidy = tidy(path);
+        if let Ok(r) = tidy.strip_prefix(&self.top) {
+            return Some(r.to_path_buf());
+        }
+        let real = std::fs::canonicalize(&tidy).ok().or_else(|| {
+            let parent = std::fs::canonicalize(tidy.parent()?).ok()?;
+            Some(parent.join(tidy.file_name()?))
+        })?;
+        real.strip_prefix(&self.top).ok().map(Path::to_path_buf)
+    }
+
+    pub fn covers(&self, path: &Path) -> bool {
+        self.relative(path).is_some()
+    }
+
+    pub fn is_file(&self, path: &Path) -> bool {
+        self.relative(path).is_some_and(|r| self.files.contains_key(&r))
+    }
+
+    pub fn is_dir(&self, path: &Path) -> bool {
+        self.relative(path).is_some_and(|r| self.dirs.contains(&r))
+    }
+
+    pub fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        match self.relative(path) {
+            Some(r) if self.files.contains_key(&r) || self.dirs.contains(&r) => {
+                Ok(self.top.join(r))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "no such file at this revision")),
+        }
+    }
+
+    pub fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let missing = || io::Error::new(io::ErrorKind::NotFound, "no such file at this revision");
+        let rel = self.relative(path).filter(|r| self.files.contains_key(r)).ok_or_else(missing)?;
+        if let Some(bytes) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&rel) {
+            return Ok(bytes.to_vec());
+        }
+        let id = self.files[&rel];
+        let repo = self.repo.to_thread_local();
+        let blob = repo.find_object(id).map_err(|_| missing())?;
+        let bytes: Arc<[u8]> = blob.data.clone().into();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(rel, bytes.clone());
+        Ok(bytes.to_vec())
+    }
+
+    pub fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+        let rel = self
+            .relative(path)
+            .filter(|r| self.dirs.contains(r))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such folder"))?;
+        let child = |p: &PathBuf| p.parent() == Some(rel.as_path()) && !p.as_os_str().is_empty();
+        let mut out: Vec<(PathBuf, bool)> = self
+            .dirs
+            .iter()
+            .filter(|p| child(p))
+            .map(|p| (self.top.join(p), true))
+            .chain(self.files.keys().filter(|p| child(p)).map(|p| (self.top.join(p), false)))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
 }
 
-pub fn is_snapshot(path: &Path) -> bool {
-    let base = std::fs::canonicalize(std::env::temp_dir().join("bench-revisions"));
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    base.is_ok_and(|b| path.starts_with(b))
+fn tidy(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+static ACTIVE: RwLock<Option<Arc<Snapshot>>> = RwLock::new(None);
+
+pub fn set_active(snapshot: Option<Arc<Snapshot>>) {
+    *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
+}
+
+pub fn active() -> Option<Arc<Snapshot>> {
+    ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn covering(path: &Path) -> Option<Arc<Snapshot>> {
+    active().filter(|s| s.covers(path))
 }
 
 pub enum Picked {
@@ -181,11 +294,13 @@ impl Picker {
 
     pub fn show(&mut self, ctx: &egui::Context) -> Picked {
         let mut picked = Picked::Browsing;
-        let modal = egui::Modal::new(egui::Id::unique(("egui_bench_revisions", &self.title)))
-            .show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique(("egui_bench_revisions", &self.title))).show(
+            ctx,
+            |ui| {
                 ui.set_width(640.0_f32.min((ctx.content_rect().width() - 48.0).max(120.0)));
                 picked = self.body(ui);
-            });
+            },
+        );
         match picked {
             Picked::Browsing if modal.should_close() => Picked::Cancelled,
             picked => picked,
@@ -241,6 +356,7 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -281,24 +397,37 @@ mod tests {
     }
 
     #[test]
-    fn checkout_opens_the_old_file_without_touching_the_working_copy() {
+    fn snapshot_reads_the_old_file_from_memory_and_leaves_disk_alone() {
         let dir = repo();
         let file = dir.path().join("board/a.pcb.toml");
         let revs = list(&dir.path().join("board"), 10).unwrap();
-        let old = checkout(&file, &revs[1].sha).unwrap();
-        assert_eq!(std::fs::read_to_string(&old).unwrap(), "v1");
-        assert!(!old.starts_with(dir.path()));
-        assert!(is_snapshot(&old));
-        assert!(!old.parent().unwrap().join("b.pcb.toml").exists());
+        let snap = Snapshot::open(&file, &revs[1].sha).unwrap();
+        assert_eq!(snap.read(&file).unwrap(), b"v1");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
-        assert!(!is_snapshot(&file));
+        assert!(!snap.is_file(&dir.path().join("board/b.pcb.toml")));
+        assert!(snap.read(&dir.path().join("board/b.pcb.toml")).is_err());
+        assert!(snap.is_dir(&dir.path().join("board")));
+        assert!(snap.covers(&dir.path().join("board/anything")));
+        assert!(!snap.covers(Path::new("/elsewhere")));
+    }
+
+    #[test]
+    fn snapshot_lists_folders_as_they_were() {
+        let dir = repo();
+        let revs = list(dir.path(), 10).unwrap();
+        let old = Snapshot::open(dir.path(), &revs[1].sha).unwrap();
+        let new = Snapshot::open(dir.path(), &revs[0].sha).unwrap();
+        let board = dir.path().canonicalize().unwrap().join("board");
+        assert_eq!(old.read_dir(&board).unwrap().len(), 1);
+        assert_eq!(new.read_dir(&board).unwrap().len(), 2);
+        assert_eq!(old.read_dir(dir.path()).unwrap(), vec![(board, true)]);
     }
 
     #[test]
     fn a_file_missing_at_that_revision_is_reported() {
         let dir = repo();
         let revs = list(dir.path(), 10).unwrap();
-        let err = checkout(&dir.path().join("board/b.pcb.toml"), &revs[1].sha).unwrap_err();
+        let err = Snapshot::open(&dir.path().join("board/b.pcb.toml"), &revs[1].sha).err().unwrap();
         assert!(err.contains("does not exist"), "{err}");
     }
 
