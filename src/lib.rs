@@ -12,6 +12,8 @@ pub mod markdown;
 pub mod meter;
 pub mod panel;
 pub mod readout;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod revision;
 #[cfg(all(feature = "speech", not(target_arch = "wasm32")))]
 pub mod speech;
 pub mod table;
