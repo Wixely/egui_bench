@@ -26,6 +26,9 @@ struct Draw {
     colour: vec4<f32>,
     emission: vec4<f32>,
     coat: vec4<f32>,
+    alpha: vec4<f32>,
+    extra_maps: vec4<f32>,
+    uv_transform: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -34,6 +37,8 @@ struct Draw {
 @group(2) @binding(1) var samp: sampler;
 @group(2) @binding(2) var normal_tex: texture_2d<f32>;
 @group(2) @binding(3) var metal_rough_tex: texture_2d<f32>;
+@group(2) @binding(4) var occlusion_tex: texture_2d<f32>;
+@group(2) @binding(5) var emission_tex: texture_2d<f32>;
 
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
     return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c < vec3<f32>(0.04045));
@@ -64,6 +69,7 @@ struct SurfaceOut {
     @location(3) uv: vec2<f32>,
     @location(4) bary: vec3<f32>,
     @location(5) tangent: vec4<f32>,
+    @location(6) @interpolate(perspective, centroid) atlas_uv: vec2<f32>,
 }
 
 const SHADED: u32 = 0u;
@@ -87,6 +93,7 @@ fn surface_vertex(v: SurfaceIn, @builtin(vertex_index) index: u32) -> SurfaceOut
     out.nor = (draw.normal * vec4<f32>(v.normal, 0.0)).xyz;
     out.col = v.colour;
     out.uv = v.uv;
+    out.atlas_uv = v.uv;
     out.tangent = vec4<f32>((draw.model * vec4<f32>(v.tangent.xyz, 0.0)).xyz, v.tangent.w);
     let corner = index % 3u;
     out.bary = vec3<f32>(f32(corner == 0u), f32(corner == 1u), f32(corner == 2u));
@@ -110,20 +117,20 @@ fn facing(n: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     return select(n, -n, dot(n, v) < 0.0);
 }
 
-fn lit(albedo: vec3<f32>, normal: vec3<f32>, base: vec3<f32>, pos: vec3<f32>, rough: f32, metal: f32) -> vec3<f32> {
+fn lit(albedo: vec3<f32>, normal: vec3<f32>, base: vec3<f32>, pos: vec3<f32>, rough: f32, metal: f32, occlusion: f32, emission: vec3<f32>) -> vec3<f32> {
     let key = frame.key.xyz;
     let fill = frame.fill.xyz;
     let v = normalize(frame.eye.xyz - pos);
     let n = facing(normalize(normal), v);
     let b = facing(normalize(base), v);
-    let d = environment(n) + frame.key_radiance.rgb * max(dot(n, key), 0.0)
+    let d = environment(n) * occlusion + frame.key_radiance.rgb * max(dot(n, key), 0.0)
         + frame.fill_radiance.rgb * max(dot(n, fill), 0.0);
     let h = normalize(key + v);
     let sp = draw.surface.z * 0.24 * pow(max(dot(n, h), 1.0e-6), sharpness(rough));
     let shine = vec3<f32>(1.0) + (albedo * 1.6 - vec3<f32>(1.0)) * metal;
     let coat = draw.coat.x * 0.12 * pow(max(dot(b, h), 1.0e-6), sharpness(draw.coat.y));
     let reflected = (sp * shine + vec3<f32>(coat)) * frame.key_radiance.rgb;
-    return to_srgb((albedo * d + reflected + draw.emission.rgb) * frame.key.w);
+    return to_srgb((albedo * d + reflected + emission) * frame.key.w);
 }
 
 fn mapped_normal(in: SurfaceOut, sample: vec3<f32>) -> vec3<f32> {
@@ -140,19 +147,34 @@ fn mapped_normal(in: SurfaceOut, sample: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn surface_fragment(in: SurfaceOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let sampled = textureSample(tex, samp, in.uv).rgb;
-    let bump = textureSample(normal_tex, samp, in.uv).rgb;
-    let metal_rough = textureSample(metal_rough_tex, samp, in.uv).rgb;
+    let uv = select(in.uv, in.atlas_uv, draw.coat.w > 0.5) * draw.uv_transform.xy + draw.uv_transform.zw;
+    let texel = textureSample(tex, samp, uv);
+    let sampled = texel.rgb;
+    let bump = textureSample(normal_tex, samp, uv).rgb;
+    let metal_rough = textureSample(metal_rough_tex, samp, uv).rgb;
+    let ao_sample = textureSample(occlusion_tex, samp, uv).r;
+    let emission_sample = textureSample(emission_tex, samp, uv).rgb;
+    let occlusion = select(1.0, mix(1.0, ao_sample, draw.extra_maps.y), draw.extra_maps.x > 0.5);
+    var emission = draw.emission.rgb;
+    if draw.extra_maps.z > 0.5 {
+        emission *= select(to_linear(emission_sample), emission_sample, draw.extra_maps.z > 1.5);
+    }
     let edge = wire(in.bary);
     let facet = cross(dpdx(in.pos), dpdy(in.pos));
     if clipped(in.pos) {
         discard;
     }
     let mode = u32(frame.debug.x);
-    let alpha = draw.params.x;
+    var alpha = draw.params.x;
+    let coverage = texel.a * draw.alpha.y;
+    if draw.alpha.x > 1.5 {
+        if coverage < draw.alpha.z { discard; }
+    } else if draw.alpha.x > 0.5 {
+        alpha *= coverage;
+    }
     var albedo = in.col;
     if draw.params.y > 0.5 {
-        albedo = to_linear(sampled);
+        albedo = select(to_linear(sampled), sampled, draw.params.y > 1.5);
     }
     albedo = mix(albedo, draw.tint.rgb, draw.tint.a);
     var rough = draw.surface.x;
@@ -203,7 +225,7 @@ fn surface_fragment(in: SurfaceOut, @builtin(front_facing) front: bool) -> @loca
     } else if mode == FACETS {
         normal = facet;
     }
-    var colour = lit(albedo, normal, in.nor, in.pos, rough, metal);
+    var colour = lit(albedo, normal, in.nor, in.pos, rough, metal, occlusion, emission);
     if mode == TRIANGLES {
         colour = mix(colour, vec3<f32>(0.06, 0.07, 0.08), edge * 0.85);
     }

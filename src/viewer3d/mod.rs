@@ -1,4 +1,12 @@
 mod controls;
+#[cfg(test)]
+mod explicit_scene_tests;
+#[cfg(test)]
+mod alpha_scene_tests;
+#[cfg(test)]
+mod extra_maps_tests;
+mod explicit_image;
+pub use explicit_image::{ExplicitImage, ImageEncoding, UploadedImage};
 mod environment;
 mod gpu;
 mod maps;
@@ -49,11 +57,24 @@ impl Shading {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AlphaMode {
+    Opaque,
+    Blend,
+    Mask { cutoff: f32 },
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Pbr {
+    /// Shared texture sampling transform: scale U/V, offset U/V. GPU raster only.
+    pub uv_transform: [f32; 4],
+    /// Texture alpha and base_alpha are ignored in Opaque mode.
+    pub alpha: AlphaMode,
+    pub base_alpha: f32,
     pub roughness: f32,
     pub metallic: f32,
     pub specular: f32,
     pub emission: V3,
+    pub occlusion_strength: f32,
     pub transmission: f32,
     pub ior: f32,
     pub clearcoat: f32,
@@ -64,10 +85,14 @@ pub struct Pbr {
 impl Default for Pbr {
     fn default() -> Self {
         Pbr {
+            alpha: AlphaMode::Opaque,
+            uv_transform: [1., 1., 0., 0.],
+            base_alpha: 1.0,
             roughness: 0.5,
             metallic: 0.0,
             specular: 0.5,
             emission: [0.0; 3],
+            occlusion_strength: 1.0,
             transmission: 0.0,
             ior: 1.5,
             clearcoat: 0.0,
@@ -117,6 +142,8 @@ pub struct Surface<M = ()> {
     pub texture: Option<usize>,
     pub normal_map: Option<usize>,
     pub metal_rough_map: Option<usize>,
+    pub occlusion_map: Option<usize>,
+    pub emission_map: Option<usize>,
     pub material: M,
     pub group: usize,
 }
@@ -142,6 +169,9 @@ pub struct Scene<M = ()> {
     pub surfaces: Vec<Surface<M>>,
     pub lines: Vec<Lines<M>>,
     pub images: Vec<Image>,
+    /// Explicit GPU overrides keyed by legacy image index. Keep level zero equal
+    /// to the legacy image and use a fresh scene id when changing either payload.
+    pub explicit_images: std::collections::BTreeMap<usize, ExplicitImage>,
     pub centre: V3,
     pub radius: f32,
 }
@@ -154,6 +184,7 @@ impl<M> Default for Scene<M> {
             surfaces: Vec::new(),
             lines: Vec::new(),
             images: Vec::new(),
+            explicit_images: Default::default(),
             centre: [0.0; 3],
             radius: 1.0,
         }
@@ -161,6 +192,58 @@ impl<M> Default for Scene<M> {
 }
 
 impl<M> Scene<M> {
+    pub fn uses_uv_transform(&self) -> bool where M: Material {
+        self.surfaces.iter().any(|s| s.material.pbr().uv_transform != [1.,1.,0.,0.])
+    }
+    pub fn uses_extra_maps(&self) -> bool {
+        self.surfaces.iter().any(|s| s.occlusion_map.is_some() || s.emission_map.is_some())
+    }
+
+    pub fn uses_material_alpha(&self) -> bool where M: Material {
+        self.surfaces.iter().any(|s| s.material.pbr().alpha != AlphaMode::Opaque)
+    }
+
+    pub fn validate_explicit_images(&self) -> Result<(), &'static str> where M: Material {
+        for surface in &self.surfaces {
+            let p = surface.material.pbr();
+            if p.uv_transform.iter().any(|v| !v.is_finite()) || p.uv_transform[0] <= 0. || p.uv_transform[1] <= 0. {
+                return Err("UV transform requires finite values and positive scale");
+            }
+            if !p.occlusion_strength.is_finite() || !(0.0..=1.0).contains(&p.occlusion_strength) {
+                return Err("occlusion strength must be finite and in 0..1");
+            }
+            if [surface.occlusion_map, surface.emission_map].into_iter().flatten().any(|i| i >= self.images.len()) {
+                return Err("occlusion/emission image index is missing");
+            }
+            if !p.base_alpha.is_finite() || !(0.0..=1.0).contains(&p.base_alpha) {
+                return Err("material alpha factor must be finite and in 0..1");
+            }
+            if let AlphaMode::Mask { cutoff } = p.alpha {
+                if !cutoff.is_finite() || !(0.0..=1.0).contains(&cutoff) {
+                    return Err("material alpha cutoff must be finite and in 0..1");
+                }
+            }
+        }
+        for (&index, explicit) in &self.explicit_images {
+            let base = self.images.get(index).ok_or("explicit image index is missing")?;
+            let level = &explicit.levels()[0];
+            if base.width != level.width || base.height != level.height || base.rgba != level.rgba {
+                return Err("explicit image base differs from scene image");
+            }
+        }
+        for surface in &self.surfaces {
+            let maps = [surface.texture, surface.normal_map, surface.metal_rough_map, surface.occlusion_map, surface.emission_map];
+            let explicit = maps.map(|i| i.and_then(|i| self.explicit_images.get(&i)));
+            if explicit.iter().any(Option::is_some) {
+                if maps.iter().zip(&explicit).any(|(map, image)| map.is_some() && image.is_none()) {
+                    return Err("material mixes explicit and legacy images");
+                }
+                explicit_image::explicit_material_lod_with_extras(explicit)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn triangles(&self) -> usize {
         self.surfaces.iter().map(|s| s.positions.len() / 3).sum()
     }
@@ -512,11 +595,11 @@ pub fn palette(index: usize) -> V3 {
     c.map(to_linear)
 }
 
-pub(super) type BatchKey<M> = (usize, M, [Option<usize>; 3]);
+pub(super) type BatchKey<M> = (usize, M, [Option<usize>; 5]);
 
 pub(super) fn batch_key<M: Material>(scene: &Scene<M>, s: &Surface<M>) -> BatchKey<M> {
     let image = |i: Option<usize>| i.filter(|i| *i < scene.images.len());
-    (s.group, s.material, [image(s.texture), image(s.normal_map), image(s.metal_rough_map)])
+    (s.group, s.material, [image(s.texture), image(s.normal_map), image(s.metal_rough_map), image(s.occlusion_map), image(s.emission_map)])
 }
 
 pub(super) fn batches<M: Material>(scene: &Scene<M>) -> (Vec<Option<usize>>, usize) {
@@ -995,15 +1078,56 @@ impl<M: Material> Viewer<M> {
         self.camera != before
     }
 
+    /// Query before render_gpu to distinguish unsupported modes from no GPU.
+    pub fn explicit_image_error(&self) -> Option<&'static str> {
+        if let Err(error) = self.scene.validate_explicit_images() { return Some(error); }
+        if self.scene.uses_uv_transform() {
+            if self.mode == RenderMode::Traversal || (self.mode == RenderMode::Shaded && self.trace.is_some()) {
+                return Some("UV transform does not support tracing preview");
+            }
+            if !gpu::installed() { return Some("UV transform requires GPU raster preview"); }
+        }
+        if self.scene.uses_extra_maps() {
+            if self.mode == RenderMode::Traversal || (self.mode == RenderMode::Shaded && self.trace.is_some()) {
+                return Some("occlusion/emission maps do not support tracing preview");
+            }
+            if !gpu::installed() { return Some("occlusion/emission maps require GPU raster preview"); }
+        }
+        if self.scene.uses_material_alpha() {
+            if self.mode == RenderMode::Traversal || (self.mode == RenderMode::Shaded && self.trace.is_some()) {
+                return Some("material alpha does not support tracing preview");
+            }
+            if !gpu::installed() { return Some("material alpha requires GPU raster preview"); }
+        }
+        if !self.scene.explicit_images.is_empty() &&
+            (self.mode == RenderMode::Traversal || (self.mode == RenderMode::Shaded && self.trace.is_some())) {
+            return Some("explicit mip images do not support tracing preview");
+        }
+        if !self.scene.explicit_images.is_empty() && !gpu::installed() {
+            return Some("explicit mip images require GPU raster preview");
+        }
+        None
+    }
+
     pub fn paint(&self, ui: &Ui, rect: Rect) -> Painted {
+        if let Some(error) = self.explicit_image_error() {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, error,
+                egui::FontId::proportional(14.0), egui::Color32::RED);
+            return Painted::default();
+        }
         gpu::paint(ui, rect, self)
     }
 
     pub fn render_gpu(&self, width: usize, height: usize) -> Option<ColorImage> {
+        if self.explicit_image_error().is_some() { return None; }
         gpu::render_gpu(self, width, height)
     }
 
     pub fn render_soft(&self, width: usize, height: usize) -> ColorImage {
+        assert!(!self.scene.uses_uv_transform(), "UV transform requires GPU raster preview");
+        assert!(!self.scene.uses_material_alpha(), "material alpha requires GPU raster preview");
+        assert!(self.scene.explicit_images.is_empty(), "explicit mip images require GPU raster preview");
+        assert!(!self.scene.uses_extra_maps(), "occlusion/emission maps require GPU raster preview");
         soft::render(self, width, height)
     }
 }

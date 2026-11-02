@@ -16,7 +16,8 @@ use web_time::{Duration, Instant};
 pub(super) const COLOUR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub(super) const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub(super) const SAMPLES: u32 = 4;
-const STRIDE: u64 = 256;
+const STRIDE: u64 = 512;
+const _: () = assert!(std::mem::size_of::<DrawUniform>() <= STRIDE as usize);
 const SETTLE: u32 = 16;
 
 #[repr(C)]
@@ -51,6 +52,9 @@ struct DrawUniform {
     colour: [f32; 4],
     emission: [f32; 4],
     coat: [f32; 4],
+    alpha: [f32; 4],
+    extra_maps: [f32; 4],
+    uv_transform: [f32; 4],
 }
 
 #[repr(C)]
@@ -71,7 +75,11 @@ struct Batch {
     texture: Option<usize>,
     normal_map: Option<usize>,
     metal_rough_map: Option<usize>,
+    occlusion_map: Option<usize>,
+    emission_map: Option<usize>,
     bind: wgpu::BindGroup,
+    explicit_colour: bool,
+    explicit_material: bool,
     first: u32,
     count: u32,
     aabb: Aabb,
@@ -314,6 +322,8 @@ impl Pipelines {
                 },
                 texture_entry(2, true),
                 texture_entry(3, true),
+                texture_entry(4, true),
+                texture_entry(5, true),
             ],
         });
         let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -594,14 +604,17 @@ fn image_view(device: &wgpu::Device, queue: &wgpu::Queue, image: &Image) -> wgpu
 fn material_group(
     state: &State,
     views: &[wgpu::TextureView],
-    maps: [Option<usize>; 3],
+    maps: [Option<usize>; 5],
+    explicit_lod: Option<u32>,
 ) -> wgpu::BindGroup {
     let view = |m: Option<usize>, blank| m.and_then(|i| views.get(i)).unwrap_or(blank);
-    let [colour, normal, metal_rough] = maps;
+    let [colour, normal, metal_rough, occlusion, emission] = maps;
     let entries = [
         (0, view(colour, &state.white)),
         (2, view(normal, &state.flat)),
         (3, view(metal_rough, &state.white)),
+        (4, view(occlusion, &state.white)),
+        (5, view(emission, &state.white)),
     ];
     let mut bound: Vec<wgpu::BindGroupEntry> = entries
         .iter()
@@ -610,9 +623,10 @@ fn material_group(
             resource: wgpu::BindingResource::TextureView(view),
         })
         .collect();
+    let explicit_sampler = explicit_lod.map(|lod| super::explicit_image::explicit_sampler(&state.device, lod));
     bound.push(wgpu::BindGroupEntry {
         binding: 1,
-        resource: wgpu::BindingResource::Sampler(&state.sampler),
+        resource: wgpu::BindingResource::Sampler(explicit_sampler.as_ref().unwrap_or(&state.sampler)),
     });
     state.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("viewer3d material"),
@@ -667,9 +681,15 @@ fn gather<M: Material>(scene: &Scene<M>) -> Vec<Gathered<M>> {
 }
 
 fn upload<M: Material>(state: &State, scene: &Scene<M>) -> Uploaded {
+    scene.validate_explicit_images().expect("invalid explicit scene images");
     let device = &state.device;
     let views: Vec<wgpu::TextureView> =
-        scene.images.iter().map(|image| image_view(device, &state.queue, image)).collect();
+        scene.images.iter().enumerate().map(|(index, image)| {
+            match scene.explicit_images.get(&index) {
+                Some(explicit) => explicit.upload(device, &state.queue).expect("validated explicit GPU image").view,
+                None => image_view(device, &state.queue, image),
+            }
+        }).collect();
     let gathered = gather(scene);
     let mut all: Vec<Vertex> = Vec::new();
     let mut batches = Vec::with_capacity(gathered.len());
@@ -689,7 +709,7 @@ fn upload<M: Material>(state: &State, scene: &Scene<M>) -> Uploaded {
             continue;
         }
         let (group, material, maps) = g.key;
-        let [texture, normal_map, metal_rough_map] = maps;
+        let [texture, normal_map, metal_rough_map, occlusion_map, emission_map] = maps;
         batches.push(Batch {
             group,
             shading: material.shading(),
@@ -697,7 +717,15 @@ fn upload<M: Material>(state: &State, scene: &Scene<M>) -> Uploaded {
             texture,
             normal_map,
             metal_rough_map,
-            bind: material_group(state, &views, maps),
+            occlusion_map,
+            emission_map,
+            bind: material_group(state, &views, maps, {
+                let explicit = maps.map(|i| i.and_then(|i| scene.explicit_images.get(&i)));
+                explicit.iter().any(Option::is_some).then(||
+                    super::explicit_image::explicit_material_lod_with_extras(explicit).expect("validated material"))
+            }),
+            explicit_colour: texture.is_some_and(|i| scene.explicit_images.contains_key(&i)),
+            explicit_material: maps.iter().flatten().any(|i| scene.explicit_images.contains_key(i)),
             first: all.len() as u32,
             count: g.vertices.len() as u32,
             aabb: g.aabb,
@@ -1102,23 +1130,31 @@ fn draw<M: Material>(
         let (s, p) = (batch.shading, batch.pbr);
         let flag = |on: bool| if on { 1.0 } else { 0.0 };
         draws.push(DrawUniform {
+            uv_transform: p.uv_transform,
             model: columns(&look.placement),
             normal: normal_matrix(&look.placement),
             tint,
             surface: [p.roughness, p.metallic, p.specular, flag(s.capped)],
-            params: [opacity, flag(batch.texture.is_some()), 0.0, flag(batch.normal_map.is_some())],
+            params: [opacity, if batch.explicit_colour { 2.0 } else { flag(batch.texture.is_some()) }, 0.0, flag(batch.normal_map.is_some())],
             colour: match viewer.mode {
                 RenderMode::Groups => four(palette(batch.group), 1.0),
                 RenderMode::Batches => four(palette(i), 1.0),
                 _ => [0.0; 4],
             },
             emission: four(p.emission, p.normal_scale),
-            coat: [p.clearcoat, p.clearcoat_roughness, flag(batch.metal_rough_map.is_some()), 0.0],
+            extra_maps: [flag(batch.occlusion_map.is_some()), p.occlusion_strength,
+                if batch.emission_map.is_none() { 0.0 } else if batch.explicit_material { 2.0 } else { 1.0 }, 0.0],
+            coat: [p.clearcoat, p.clearcoat_roughness, flag(batch.metal_rough_map.is_some()), flag(batch.explicit_material)],
+            alpha: match p.alpha {
+                super::AlphaMode::Opaque => [0.0, 1.0, 0.0, 0.0],
+                super::AlphaMode::Blend => [1.0, p.base_alpha, 0.0, 0.0],
+                super::AlphaMode::Mask { cutoff } => [2.0, p.base_alpha, cutoff, 0.0],
+            },
         });
         let box_ = placed(&batch.aabb, &look);
         items.push(Item {
             kind: Kind::Batch(i),
-            see_through: opacity < 1.0,
+            see_through: opacity < 1.0 || p.alpha == super::AlphaMode::Blend,
             distance: distance(&box_),
         });
         corners.push(box_);
@@ -1140,7 +1176,10 @@ fn draw<M: Material>(
             params: [opacity, 0.0, pixels, 0.0],
             colour: [colour[0], colour[1], colour[2], 1.0],
             emission: [0.0; 4],
+            extra_maps: [0.0; 4],
+            uv_transform: [1.,1.,0.,0.],
             coat: [0.0; 4],
+            alpha: [0.0; 4],
         });
         let box_ = placed(&stroke.aabb, &look);
         items.push(Item {
