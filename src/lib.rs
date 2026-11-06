@@ -12,11 +12,14 @@ pub mod markdown;
 pub mod meter;
 pub mod panel;
 pub mod readout;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod revision;
 #[cfg(all(feature = "speech", not(target_arch = "wasm32")))]
 pub mod speech;
 pub mod table;
 pub mod text;
 pub mod theme;
+pub mod toast;
 pub mod trace;
 #[cfg(all(feature = "update", not(target_arch = "wasm32")))]
 pub mod update;
@@ -45,6 +48,7 @@ pub mod prelude {
         self, BAND, CHASSIS, ETCH, FAULT, LEGEND, OK, PANEL, READOUT, READOUT_DIM, SAFE, TRACE,
         VALUE, WARN, WELL, figure, install, legend_font, mono,
     };
+    pub use crate::toast::{Tone, toast};
     pub use crate::trace::{Scale, Trace};
 }
 
